@@ -1,0 +1,21 @@
+1) Code Transformation:
+To generate the TryCatchWS code, please use the bash script transform.sh as:
+
+./translate/transform.sh Jacobi.java
+
+2) Compilation:
+Then compile the generated code as:
+
+cd gen
+javac -classpath /Path/To/Jikes RVM 3.1.3/dist/production_*/jksvm.jar Jacobi.java
+
+3) Execution:
+
+/Path/To/Jikes RVM 3.1.3/dist/production_*/rvm -Xws:procs=<Number of WS Threads> Jacobi
+
+4) Extra options:
+
+You may find the supported options by executing following:
+
+/Path/To/Jikes RVM 3.1.3/dist/production_*/rvm -X
+

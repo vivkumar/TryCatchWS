@@ -1,0 +1,19 @@
+To update JikesRVM with the JavaTryCatchWS functionality, do the following:
+
+
+==========================================================================
+1st September 2015: Latest patch based on hg version 11181
+==========================================================================
+1) Clone Jikes RVM from repository:
+hg clone  http://hg.code.sourceforge.net/p/jikesrvm/code jikesrvm
+
+2) 
+cd jikesrvm
+hg update -r 11181
+patch -p1 <./JavaTryCatchWS_hg11181.patch
+
+3) Copy the files "../common/WS.java", "StackFrameCopier.java" and "../common/ParallelForWS.java"
+inside the directory: "rvm/src/org/jikesrvm/scheduler".
+
+4) Now you can use the buildit to build the rvm:
+./bin/buildit localhost production

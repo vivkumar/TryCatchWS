@@ -1,0 +1,4840 @@
+diff -r 189a5647ca94 MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/ScanThread.java
+--- a/MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/ScanThread.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/ScanThread.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -37,6 +37,7 @@
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.ObjectReference;
+ import org.vmmagic.unboxed.Offset;
++import org.vmmagic.unboxed.WordArray;
+ 
+ /**
+  * Class that supports scanning thread stacks for references during
+@@ -143,10 +144,43 @@
+     Registers regs = thread.getContextRegisters();
+     Address gprs = Magic.objectAsAddress(regs.gprs);
+ 
+-    Address ip = regs.getInnermostInstructionAddress();
+-    Address fp = regs.getInnermostFramePointer();
++    Address ip_main=regs.getInnermostInstructionAddress();
++    Address fp_main =regs.getInnermostFramePointer();
++
++    /*
++     * While performing work-stealing with return barrier, thieves
++     * create a snapshot of victim's thread stack. This cloned stack
++     * contains references to live objects as long as the victim
++     * has return barrier installed on its main stack. 
++     * 
++     * If we do not scan the cloned stack, then we may loose references
++     * to live objects as it may be collected after scanning only the main
++     * stack. Hence, we have to make sure we compute the roots by scanning
++     * both the cloned and main stack as long as return barrier is installed
++     * on victim's main stack
++     * 
++     * As seen on NQueens and UTS benchmarks (which performs GC), there is 
++     * very insignificant change in the gc time due to scanning cloned stack
++     * as well.
++     * 
++     */
++    if(thread.wsMaintainsClonedStackAlso()) {
++    	if(false) {
++    		// Also scan the wsShadowStack
++    		WordArray gprs_actual = regs.gprs;
++    		// initialize it from the backup gprs
++    		regs.clear();
++    		thread.wsSetInnermost();
++		// UNTESTED CODE JavaTryCatchWS
++    		scanThread(thread, trace, processCodeLocations, gprs, Address.zero(),newRootsSufficient);
++    	}
++    	else {
++    		thread.deInstallStackTrampoline_fromGC();
++    	}
++    }
++
+     regs.clear();
+-    regs.setInnermost(ip,fp);
++    regs.setInnermost(ip_main,fp_main);
+ 
+     scanThread(thread, trace, processCodeLocations, gprs, Address.zero(), newRootsSufficient);
+   }
+@@ -312,6 +346,15 @@
+     /* If a thread started via createVM or attachVM, base may need scaning */
+     checkJNIBase();
+ 
++    if (thread.wsSpecialNVMap != 0) {
++      for(int i=0; i < ArchitectureSpecific.ArchConstants.NONVOLATILE_GPRS.length; i++) {
++        int reg = ArchitectureSpecific.ArchConstants.NONVOLATILE_GPRS[i].value();
++        if ((thread.wsSpecialNVMap & (1 << reg)) != 0) {
++          reportDelayedRootEdge(trace, iteratorGroup.getRegisterLocation(reg));
++        }
++      }
++    }
++
+     if (verbosity >= 2) Log.writeln("--- End Of Stack Scan ---\n");
+   }
+ 
+@@ -410,10 +453,12 @@
+       }
+ 
+       /* reinstall the return barrier if necessary (and verbosity indicates that this is a regular scan) */
++/** JikesRVM Try-CatchWS -- untested code, so commenting...
+       if (reinstallReturnBarrier && verbosity == DEFAULT_VERBOSITY) {
+-        thread.installStackTrampolineBridge(fp);
++        thread.wsInstallStackTrampolineBridge(fp);
+         reinstallReturnBarrier = false;
+       }
++*/
+     }
+     return fp;
+   }
+diff -r 189a5647ca94 MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/Statistics.java
+--- a/MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/Statistics.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/ext/vm/jikesrvm/org/jikesrvm/mm/mmtk/Statistics.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -15,6 +15,7 @@
+ import org.mmtk.utility.statistics.PerfEvent;
+ import org.jikesrvm.runtime.Time;
+ import static org.jikesrvm.runtime.SysCall.sysCall;
++import org.jikesrvm.scheduler.WS;
+ 
+ import org.vmmagic.pragma.*;
+ 
+@@ -85,5 +86,23 @@
+   public void perfEventRead(int id, long[] values) {
+     sysCall.sysPerfEventRead(id, values);
+   }
++
++  /**
++   * Work-Stealing harness calls
++   */
++  @Override
++  public void wsHarnessBegin() {
++	  WS.harnessBegin();  
++  }
++  
++  @Override
++  public void wsHarnessEnd() {
++	  WS.harnessEnd();  
++  }
++  
++  @Override
++  public void wsUpdateStealRatioExternally(int steals, int pushes) {
++	  WS.updateStealRatioExternally(steals, pushes);
++  }
+ }
+ 
+diff -r 189a5647ca94 MMTk/src/org/mmtk/plan/Plan.java
+--- a/MMTk/src/org/mmtk/plan/Plan.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/src/org/mmtk/plan/Plan.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -742,6 +742,14 @@
+    */
+   protected static boolean insideHarness = false;
+ 
++  /*
++   * Java Try-CatchWS 
++   */
++  @Interruptible
++  public static void updateStealRatioExternally(int steals, int pushes) {
++	  VM.statistics.wsUpdateStealRatioExternally(steals, pushes);
++  }
++
+   /**
+    * Generic hook to allow benchmarks to be harnessed.  A plan may use
+    * this to perform certain actions prior to the commencement of a
+diff -r 189a5647ca94 MMTk/src/org/mmtk/utility/statistics/EventCounter.java
+--- a/MMTk/src/org/mmtk/utility/statistics/EventCounter.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/src/org/mmtk/utility/statistics/EventCounter.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -91,6 +91,13 @@
+     if (running) inc(1);
+   }
+ 
++  /*
++   * To be used for jikesrvm work-stealing logs
++   */
++  public void wsInc(long value) {
++          if (running) currentCount += value;
++  }
++
+   /**
+    * Increment the event counter by <code>value</code>
+    *
+diff -r 189a5647ca94 MMTk/src/org/mmtk/utility/statistics/Stats.java
+--- a/MMTk/src/org/mmtk/utility/statistics/Stats.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/src/org/mmtk/utility/statistics/Stats.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -42,7 +42,7 @@
+   public static final boolean GATHER_MARK_CONS_STATS = false;
+ 
+   /** Maximum number of gc/mutator phases that can be counted */
+-  static final int MAX_PHASES = 1 << 12;
++  static final int MAX_PHASES = 1 << 17; // To avoid the MAX_PHASE errors in Integrate and Matmul application
+   /** Maximum number of counters that can be in operation */
+   static final int MAX_COUNTERS = 100;
+ 
+@@ -135,6 +135,9 @@
+         counter[c].start();
+     }
+ 
++    // work-stealing harness hook
++    VM.statistics.wsHarnessBegin();
++
+     if (Options.xmlStats.getValue()) {
+       Xml.begin();
+       Xml.openTag("mmtk-stats");
+@@ -147,6 +150,8 @@
+    */
+   @Interruptible
+   public static void stopAll() {
++    // work-stealing harness hook
++    VM.statistics.wsHarnessEnd();
+     stopAllCounters();
+     Stats.printStats();
+     if (Options.xmlStats.getValue()) {
+diff -r 189a5647ca94 MMTk/src/org/mmtk/vm/Statistics.java
+--- a/MMTk/src/org/mmtk/vm/Statistics.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/MMTk/src/org/mmtk/vm/Statistics.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -82,4 +82,11 @@
+    * read (3 64-bit values).
+    */
+   public abstract void perfEventRead(int counter, long[] values);
++
++  /*
++   * Work-Stealing harness calls
++   */
++  public abstract void wsHarnessBegin();
++  public abstract void wsHarnessEnd();
++  public abstract void wsUpdateStealRatioExternally(int steals, int pushes);
+ }
+diff -r 189a5647ca94 bin/buildit
+--- a/bin/buildit	Fri Apr 24 08:29:05 2015 +0200
++++ b/bin/buildit	Mon Aug 31 23:58:51 2015 -0500
+@@ -74,6 +74,8 @@
+      --x87            Use x87 Compatibility mode.
+  -c, --cross-to       Crossbuild to target host (or copy post build).
+      --with-perfevent Build with perf event support
++     --with-libnuma   Build with NUMA support
++     --for-macos      Build for MacOSX
+  -a, --with-acheck    Build with align checks, implies --x87 --processors 1
+  -g, --gdb-symbols    Build with gdb symbols
+  -q, --quick          Quick build (not 100% safe - doesn't regenerate source)
+@@ -172,6 +174,8 @@
+   "q|quick" => \$quick,
+   "processors=s" => \$procs,
+   "with-perfevent" => \$with_perfevent,
++  "with-libnuma" => \$with_libnuma,
++  "for-macos" => \$for-macos,
+   "a|with-acheck" => \$with_acheck,
+   "z|skip-build" => \$skip_build,
+   "h|help" => \$help,
+@@ -697,6 +701,12 @@
+     if ($with_perfevent ne "") {
+       $defs .= "-Dconfig.include.perfevent=true ";
+     }
++    if ($with_libnuma ne "") {
++      $defs .= "-Dconfig.include.libnuma=true ";
++    }
++    if ($for-macos ne "") {
++      $defs .= "-Dconfig.include.macos=true ";
++    }
+     if ($with_acheck ne "") {
+       $defs .= "-Dconfig.alignment-checking=true ";
+     }
+diff -r 189a5647ca94 build.xml
+--- a/build.xml	Fri Apr 24 08:29:05 2015 +0200
++++ b/build.xml	Mon Aug 31 23:58:51 2015 -0500
+@@ -411,7 +411,15 @@
+       <equals arg1="${config.include.perfevent}" arg2="true"/>
+     </condition>
+ 
+-    <property name="filter" value="${arch.filter} ${os.filter} ${addr.filter} ${gctrace.filter} ${gcspy.filter} ${alignment-checking.filter} ${perfevent.filter} ${classlib.filter}"/>
++    <condition property="libnuma.filter" value="-DRVM_WITH_LIBNUMA=1" else="">
++      <equals arg1="${config.include.libnuma}" arg2="true"/>
++    </condition>
++
++    <condition property="macos.filter" value="-DRVM_FOR_MACOS=1" else="">
++      <equals arg1="${config.include.macos}" arg2="true"/>
++    </condition>
++
++    <property name="filter" value="${arch.filter} ${os.filter} ${addr.filter} ${gctrace.filter} ${gcspy.filter} ${alignment-checking.filter} ${perfevent.filter} ${libnuma.filter} ${macos.filter} ${classlib.filter}"/>
+   </target>
+ 
+   <!-- **************************************************************************** -->
+@@ -1833,6 +1841,10 @@
+       <equals arg1="${config.include.perfevent}" arg2="true"/>
+     </condition>
+ 
++    <condition property="libnuma.lib" value="-lnuma" else="">
++      <equals arg1="${config.include.libnuma}" arg2="true"/>
++    </condition>
++
+     <if>
+       <conditions>
+         <equals arg1="${classlib.provider}" arg2="GNU Classpath"/>
+@@ -1840,7 +1852,7 @@
+       <sequential>
+         <echo message="Creating JikesRVM"/>
+         <exec executable="${c++.exe}" failonerror="true">
+-          <arg line="${c++.args} ${rvm.common.args} ${gcspy.lib.dir} ${rvm.src} ${perfevent.lib} ${c++.librt} -lpthread ${c++.rdynamic} -g"/>
++          <arg line="${c++.args} ${rvm.common.args} ${gcspy.lib.dir} ${rvm.src} ${perfevent.lib} ${c++.librt} ${libnuma.lib} -lpthread ${c++.rdynamic} -g"/>
+           <arg value="-o"/>
+           <arg path="${build.base}/JikesRVM"/>
+           <arg value="-L${build.base}"/>
+@@ -1856,7 +1868,7 @@
+       <sequential>
+         <echo message="Creating JikesRVM"/>
+         <exec executable="${c++.exe}" failonerror="true">
+-          <arg line="${c++.args} ${rvm.common.args} ${gcspy.lib.dir} ${rvm.src} ${perfevent.lib} ${c++.librt} -lpthread ${c++.rdynamic} -g"/>
++          <arg line="${c++.args} ${rvm.common.args} ${gcspy.lib.dir} ${rvm.src} ${perfevent.lib} ${c++.librt} ${libnuma.lib} -lpthread ${c++.rdynamic} -g"/>
+           <arg value="-o"/>
+           <arg path="${build.base}/JikesRVM"/>
+           <arg value="-L${build.base}"/>
+@@ -1926,6 +1938,7 @@
+ config.mmtk.plan=${config.mmtk.plan}
+ config.include.aos=${config.include.aos}
+ config.include.perfevent=${config.include.perfevent}
++config.include.libnuma=${config.include.libnuma}
+ config.include.gcspy=${config.include.gcspy}
+ config.include.gcspy-client=${config.include.gcspy-client}
+ config.assertions=${config.assertions}
+@@ -1983,6 +1996,7 @@
+ config.mmtk.plan=${config.mmtk.plan}
+ config.include.aos=${config.include.aos}
+ config.include.perfevent=${config.include.perfevent}
++config.include.libnuma=${config.include.libnuma}
+ config.include.gcspy=${config.include.gcspy}
+ config.include.gcspy-client=${config.include.gcspy-client}
+ config.assertions=${config.assertions}
+diff -r 189a5647ca94 rvm/src-generated/ia32-assembler-opt/GenerateAssembler.java
+--- a/rvm/src-generated/ia32-assembler-opt/GenerateAssembler.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src-generated/ia32-assembler-opt/GenerateAssembler.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -13,6 +13,7 @@
+ import java.io.*;
+ import java.util.*;
+ import java.lang.reflect.*;
++import org.jikesrvm.VM;
+ 
+ /**
+  * <P>
+@@ -1226,9 +1227,31 @@
+       emit(" */\n");
+       emitTab(1);
+       emit("private void do" + opcode + "(Instruction inst) {\n");
++      if (opcode.equals("CALL")) {
++        emitTab(2);
++        emit("boolean join = MIR_Call.getMethod(inst) != null && (MIR_Call.getMethod(inst).getMemberRef() == org.jikesrvm.runtime.Entrypoints.workStealingJoinMethod || MIR_Call.getMethod(inst).getMemberRef() == org.jikesrvm.runtime.Entrypoints.workStealingFinishMethod);\n");
++        emitTab(2);
++        emit("boolean recurse = isImm(MIR_Call.getTarget(inst)) && getImm(MIR_Call.getTarget(inst)) == 0;\n");
++        emitTab(2);
++        emit("int start = getMachineCodeIndex();\n");
++      }
+       EmitterSet emitter = buildSetForOpcode(emitters, opcode);
+       boolean[][] tp = new boolean[4][ArgumentType.values().length];
+       emitter.emitSet(opcode, tp, 2);
++      if (opcode.equals("CALL")) {
++        emitTab(2);
++        emit("if (join) {\n");
++        emitTab(3);
++        emit("addJoinRegion(start, getMachineCodeIndex());\n");
++        emitTab(2);
++        emit("}\n");
++        emitTab(2);
++        emit("if (recurse) {\n");
++        emitTab(3);
++        emit("addRecursion(start);\n");
++        emitTab(2);
++        emit("}\n");
++      }
+       emitTab(1);
+       emit("}\n\n");
+     }
+diff -r 189a5647ca94 rvm/src-generated/ia32-assembler-opt/Magic.fake
+--- a/rvm/src-generated/ia32-assembler-opt/Magic.fake	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src-generated/ia32-assembler-opt/Magic.fake	Mon Aug 31 23:58:51 2015 -0500
+@@ -18,4 +18,5 @@
+ public class Magic {
+   public static void setIntAtOffset(Object o, Offset x, int y) { }
+   public static Address getTocPointer() { return Address.zero(); }
++  public static Address objectAsAddress(Object o) { return Address.zero(); }
+ }
+diff -r 189a5647ca94 rvm/src-generated/ia32-assembler/Assembler.in
+--- a/rvm/src-generated/ia32-assembler/Assembler.in	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src-generated/ia32-assembler/Assembler.in	Mon Aug 31 23:58:51 2015 -0500
+@@ -188,6 +188,36 @@
+    */
+   protected final Lister lister;
+ 
++  public int [] joinRegions = new int[0];
++  
++  protected void addJoinRegion(int start, int end) {
++    int[] newRegions = new int[joinRegions.length+2];
++    for(int i=0;i<joinRegions.length;i++) {
++      newRegions[i] = joinRegions[i];
++    } 
++    joinRegions = newRegions;
++    joinRegions[joinRegions.length-2] = start;
++    joinRegions[joinRegions.length-1] = end - start;
++  }
++  
++  public int [] recursions = new int[0];
++  
++  protected void addRecursion(int start) {
++    int[] newRecursions = new int[recursions.length+1];
++    for(int i=0;i<recursions.length;i++) {
++      newRecursions[i] = recursions[i];
++    } 
++    recursions = newRecursions;
++    recursions[recursions.length-1] = start;
++  }
++  
++  public final void changeCALL_Imm(ArchitectureSpecific.CodeArray code, int start, int imm) {
++    code.set(start+1, (byte) ((imm >>  0) & 0xFF));
++    code.set(start+2, (byte) ((imm >>  8) & 0xFF));
++    code.set(start+3, (byte) ((imm >> 16) & 0xFF));
++    code.set(start+4, (byte) ((imm >> 24) & 0xFF));  
++  }
++
+   /**
+    * The array holding the generated binary code.
+    */
+@@ -325,6 +355,27 @@
+     return trimmed;
+   }
+ 
++  public final ArchitectureSpecific.CodeArray patchMachineCodeForWorkStealing(ArchitectureSpecific.CodeArray slow) {
++    if (joinRegions.length == 0) {
++      return slow;
++    }
++
++    // Generate a fast version without join calls, that recurses to itself.
++    for(int i=0; i<joinRegions.length; i+=2) {
++      replaceWithNOP(joinRegions[i], joinRegions[i+1]);
++    }
++
++    ArchitectureSpecific.CodeArray fast = getMachineCodes();
++
++    // Change the slow version to recurse to the fast version.
++    int delta = Magic.objectAsAddress(fast).diff(Magic.objectAsAddress(slow)).toInt();
++    for(int i=0; i<recursions.length; i++) {
++      changeCALL_Imm(slow, recursions[i], delta - (recursions[i] + 5));
++    }
++
++    return fast;
++  }
++
+   /**
+    * Give the lister a message associated with a particular
+    * bytecode.  This is used by the baseline assembler to print the
+@@ -2100,6 +2151,13 @@
+     if (lister != null) lister.OP(miStart, "SAHF");
+   }
+ 
++  public final void replaceWithNOP (int start, int length) {
++    int oldMi = mi;
++    mi = start;
++    emitNOP(length);
++    mi = oldMi;
++  }
++
+   /**
+    * Emit NOP instruction
+    *
+diff -r 189a5647ca94 rvm/src-generated/vm-configuration/ArchitectureSpecific.template
+--- a/rvm/src-generated/vm-configuration/ArchitectureSpecific.template	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src-generated/vm-configuration/ArchitectureSpecific.template	Mon Aug 31 23:58:51 2015 -0500
+@@ -13,6 +13,7 @@
+ package org.jikesrvm;
+ 
+ import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ import org.vmmagic.pragma.NonMoving;
+ 
+ import org.jikesrvm.compilers.baseline.BaselineCompiledMethod;
+@@ -33,7 +34,7 @@
+   public interface BaselineConstants extends org.jikesrvm.@_ARCH_@.BaselineConstants {}
+   public static final class BaselineExceptionDeliverer extends org.jikesrvm.compilers.baseline.@_ARCH_@.BaselineExceptionDeliverer {}
+   public static final class BaselineGCMapIterator extends org.jikesrvm.compilers.baseline.@_ARCH_@.BaselineGCMapIterator {
+-    public BaselineGCMapIterator(WordArray registerLocations) {
++    public BaselineGCMapIterator(AddressArray registerLocations) {
+       super(registerLocations);
+     }}
+   public static final class CodeArray extends org.jikesrvm.@_ARCH_@.CodeArray {
+@@ -68,7 +69,7 @@
+   public interface StackframeLayoutConstants extends org.jikesrvm.@_ARCH_@.StackframeLayoutConstants {}
+   public static final class JNICompiler extends org.jikesrvm.jni.@_ARCH_@.JNICompiler {}
+   public static final class JNIGCMapIterator extends org.jikesrvm.jni.@_ARCH_@.JNIGCMapIterator {
+-    public JNIGCMapIterator(WordArray registerLocations) {
++    public JNIGCMapIterator(AddressArray registerLocations) {
+       super(registerLocations);
+     }}
+   public static final class JNIHelpers extends org.jikesrvm.jni.@_ARCH_@.JNIHelpers {}
+diff -r 189a5647ca94 rvm/src-generated/vm-configuration/ArchitectureSpecificOpt.template
+--- a/rvm/src-generated/vm-configuration/ArchitectureSpecificOpt.template	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src-generated/vm-configuration/ArchitectureSpecificOpt.template	Mon Aug 31 23:58:51 2015 -0500
+@@ -12,7 +12,7 @@
+  */
+ package org.jikesrvm;
+ 
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ 
+ import org.jikesrvm.classloader.RVMMethod;
+ import org.jikesrvm.compilers.opt.lir2mir.BURS;
+@@ -53,7 +53,7 @@
+   public static final class StackManager extends org.jikesrvm.compilers.opt.regalloc.@_ARCH_@.StackManager {}
+   public static final class OptExceptionDeliverer extends org.jikesrvm.compilers.opt.runtimesupport.@_ARCH_@.OptExceptionDeliverer {}
+   public static final class OptGCMapIterator extends org.jikesrvm.compilers.opt.runtimesupport.@_ARCH_@.OptGCMapIterator {
+-    public OptGCMapIterator(WordArray registerLocations) {
++    public OptGCMapIterator(AddressArray registerLocations) {
+       super(registerLocations);
+     }}
+   public interface OptGCMapIteratorConstants extends org.jikesrvm.compilers.opt.runtimesupport.@_ARCH_@.OptGCMapIteratorConstants {}
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/CommandLineArgs.java
+--- a/rvm/src/org/jikesrvm/CommandLineArgs.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/CommandLineArgs.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -25,6 +25,7 @@
+ import org.jikesrvm.compilers.common.RuntimeCompiler;
+ import org.jikesrvm.mm.mminterface.MemoryManager;
+ import org.jikesrvm.scheduler.RVMThread;
++import org.jikesrvm.scheduler.WS;
+ 
+ /**
+  * Command line option processing iwth arbitrary prefix support.
+@@ -81,7 +82,18 @@
+     BOOTCLASSPATH_P_ARG,
+     BOOTCLASSPATH_A_ARG,
+     BOOTSTRAP_CLASSES_ARG,
+-    AVAILABLE_PROCESSORS_ARG
++    AVAILABLE_PROCESSORS_ARG,
++    WS_PIN_MAP_APP_THREADS,
++    WS_AUTO_PIN_APP_THREAD,
++    WS_PIN_LOG,
++    WS_PIN_SOCKETS_HINT,
++    WS_PIN_MAP_SYSTEM_THREADS,
++    PER_THREAD_PERF_EVENTS,
++    WS_PIN_MAP_GC_THREADS,
++    WS_PROCS,
++    WS_AUTOGEN_WSTHREADS,
++    WS_RETURN_BARRIER,
++    WS_STATISTICS,
+   }
+ 
+   /** Represent a single command line prefix */
+@@ -210,6 +222,17 @@
+                                             new Prefix("-X:vm:help$", PrefixType.HELP_ARG),
+                                             new Prefix("-X:vm$", PrefixType.HELP_ARG),
+                                             new Prefix("-X:vm:", PrefixType.ARG),
++					    new Prefix("-Xws:pinMap=", PrefixType.WS_PIN_MAP_APP_THREADS),
++                                            new Prefix("-Xws:pinAuto=", PrefixType.WS_AUTO_PIN_APP_THREAD),
++                                            new Prefix("-Xws:pinLog=", PrefixType.WS_PIN_LOG),
++                                            new Prefix("-Xws:pinSocketCPU=", PrefixType.WS_PIN_SOCKETS_HINT),
++                                            new Prefix("-Xws:pinMapSys=", PrefixType.WS_PIN_MAP_SYSTEM_THREADS),
++                                            new Prefix("-Xws:perfEvent=", PrefixType.PER_THREAD_PERF_EVENTS),
++                                            new Prefix("-Xws:pinMapGC=", PrefixType.WS_PIN_MAP_GC_THREADS),
++                                            new Prefix("-Xws:procs=", PrefixType.WS_PROCS),
++                                            new Prefix("-Xws:autoThreads=", PrefixType.WS_AUTOGEN_WSTHREADS),
++                                            new Prefix("-Xws:retBarrier=", PrefixType.WS_RETURN_BARRIER),
++                                            new Prefix("-Xws:stats=", PrefixType.WS_STATISTICS),
+ 
+                                             /* Silently ignored */
+                                             new Prefix("-Xverify", PrefixType.VERIFY_ARG),
+@@ -689,6 +712,58 @@
+             VM.sysExit(EXIT_STATUS_BOGUS_COMMAND_LINE_ARG);
+           }
+           break;
++        case WS_PIN_MAP_APP_THREADS:
++                final String[] map_ws = arg.split(":");
++                RVMThread.pin_map_workers = new int[map_ws.length];
++                RVMThread.ws_pinning_workers = true;
++                for(int xx=0; xx<map_ws.length; xx++) RVMThread.pin_map_workers[xx] = primitiveParseInt(map_ws[xx]);
++            break;
++        case WS_AUTO_PIN_APP_THREAD:
++                final String[] pinning = getArgs(PrefixType.WS_AUTO_PIN_APP_THREAD);
++                RVMThread.ws_pinning_workers = pinning[0].equals("true");
++            break;
++        case WS_PIN_LOG:
++                final String[] trace = getArgs(PrefixType.WS_PIN_LOG);
++                WS.pinLog = trace[0].equals("true");
++            break;
++        case WS_PIN_SOCKETS_HINT:
++                // cpuMap = <Total Sockets>:<Core Per Socket>
++                RVMThread.ws_pinning_workers = true;
++                final String[] sockets = arg.split(":");
++                RVMThread.sockets = primitiveParseInt(sockets[0]);
++                RVMThread.cpusPerSocket = primitiveParseInt(sockets[1]);
++            break;
++        case WS_PIN_MAP_SYSTEM_THREADS:
++                final String[] map_sys = arg.split(":");
++                RVMThread.pin_map_system = new int[map_sys.length];
++                RVMThread.ws_pinning_system = true;
++                for(int xx=0; xx<map_sys.length; xx++) RVMThread.pin_map_system[xx] = primitiveParseInt(map_sys[xx]);
++            break;
++        case WS_PIN_MAP_GC_THREADS:
++                final String[] map_gc = arg.split(":");
++                RVMThread.pin_map_gc = new int[map_gc.length];
++                RVMThread.ws_pinning_gc = true;
++                for(int xx=0; xx<map_gc.length; xx++) RVMThread.pin_map_gc[xx] = primitiveParseInt(map_gc[xx]);
++                break;
++        case PER_THREAD_PERF_EVENTS:
++        	final String[] perf_ws = getArgs(PrefixType.PER_THREAD_PERF_EVENTS);
++        	RVMThread.wsPerThreadPerf = perf_ws[0].equals("true");
++        	break;
++        case WS_PROCS:
++        	WS.wsProcs = primitiveParseInt(arg);
++        	break;
++        case WS_AUTOGEN_WSTHREADS:
++//        	final String[] autogen_ws = getArgs(PrefixType.WS_AUTOGEN_WSTHREADS);
++//        	RVMThread.autogenWSThread = autogen_ws[0].equals("true");
++        	break;
++        case WS_RETURN_BARRIER:
++        	final String[] useBarrier = getArgs(PrefixType.WS_RETURN_BARRIER);
++        	RVMThread.wsRetBarrier = useBarrier[0].equals("true");
++        	break;
++        case WS_STATISTICS:
++        	final String[] wsStats = getArgs(PrefixType.WS_STATISTICS);
++        	WS.stats = wsStats[0].equals("true");
++        	break;
+       }
+     }
+   }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/VM.java
+--- a/rvm/src/org/jikesrvm/VM.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/VM.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -170,7 +170,7 @@
+     // get pthread_id from OS and store into vm_processor field
+     //
+     sysCall.sysSetupHardwareTrapHandler();
+-    RVMThread.getCurrentThread().pthread_id = sysCall.sysGetThreadId();
++    RVMThread.getCurrentThread().thread_id = sysCall.sysGetThreadId();
+     RVMThread.getCurrentThread().priority_handle = sysCall.sysGetThreadPriorityHandle();
+     RVMThread.availableProcessors = SysCall.sysCall.sysNumProcessors();
+ 
+@@ -910,7 +910,7 @@
+   @NoInline
+   /* don't waste code space inlining these --dave */
+   public static void write(long value) {
+-    write(value, true);
++    write(value, false);
+   }
+ 
+   /**
+@@ -1038,6 +1038,22 @@
+   }
+ 
+   @NoInline
++  public static void sysWriteln(int a, String b, String c, String d, long e, String f, long g, String h, long i) {
++    swLock();
++    write(a);
++    write(b);
++    write(c);
++    write(d);
++    write(e);
++    write(f);
++    write(g);
++    write(h);
++    write(i);
++    write("\n");
++    swUnlock();
++  }
++
++  @NoInline
+   public static void sysWrite(RVMMember m) {
+     swLock();
+     write(m);
+@@ -1514,6 +1530,17 @@
+     swUnlock();
+   }
+   @NoInline
++  public static void sysWriteln(Address a1, Address a2, Address a3) {
++   swLock();
++   write(a1);
++   write(" ");
++   write(a2);
++   write(" ");
++   write(a3);
++   writeln();
++   swUnlock();
++  }
++  @NoInline
+   public static void sysWriteln(String s1, Address a1,Address a2) {
+     swLock();
+     write(s1);
+@@ -1608,6 +1635,16 @@
+   }
+ 
+   @NoInline
++  public static void sysWriteln(Offset o1, String s, Offset o2) {
++    swLock();
++    write(o1);
++    write(s);
++    write(o2);
++    writeln();
++    swUnlock();
++  }
++
++  @NoInline
+   public static void sysWrite(String s1, String s2, String s3) {
+     swLock();
+     write(s1);
+@@ -1886,6 +1923,55 @@
+   }
+ 
+   @NoInline
++  public static void sysWriteln(String s1, Offset o1, String s2, Offset o2) {
++    swLock();
++    write(s1);
++    write(o1);
++    write(s2);
++    write(o2);
++    writeln();
++    swUnlock();
++  }
++  
++  @NoInline
++  public static void sysWriteln(Offset o, String s1, Offset o1, String s2, Offset o2) {
++    swLock();
++    write(o);
++    write(s1);
++    write(o1);
++    write(s2);
++    write(o2);
++    writeln();
++    swUnlock();
++  }
++  
++  @NoInline
++  public static void sysWriteln(int i1, String s1, Offset o, String s2, int i2) {
++    swLock();
++    write(i1);
++    write(s1);
++    write(o);
++    write(s2);
++    write(i2);
++    writeln();
++    swUnlock();
++  }
++
++  @NoInline
++  public static void sysWriteln(int i1, int i2, Offset o1, Offset o2) {
++    swLock();
++    write(i1);
++    write(" ");
++    write(i2);
++    write(" ");
++    write(o1);
++    write(" ");
++    write(o2);
++    writeln();
++    swUnlock();
++  }
++
++  @NoInline
+   public static void sysWrite(String s1, double d, String s2) {
+     swLock();
+     write(s1);
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/classloader/RVMType.java
+--- a/rvm/src/org/jikesrvm/classloader/RVMType.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/classloader/RVMType.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -134,6 +134,11 @@
+   public static final RVMClass IMTType;
+   public static final RVMClass FunctionTableType;
+   public static final RVMClass LinkageTripletTableType;
++  public static final RVMClass WSContinuationType;
++  public static final RVMClass WSFinishType;
++  public static final RVMClass WSJoinType;
++  public static final RVMClass WSFinishFirstType;
++  public static final RVMClass RVMThreadType;
+ 
+   static {
+     // Primitive types
+@@ -179,6 +184,12 @@
+     JavaIoSerializableType = TypeReference.JavaIoSerializable.resolve().asClass();
+     JavaLangRefReferenceType = TypeReference.JavaLangRefReference.resolve().asClass();
+     JavaLangRefReferenceReferenceField = JavaLangRefReferenceType.findDeclaredField(Atom.findAsciiAtom("_referent"));
++    // WorkStealing
++    WSContinuationType = TypeReference.WSContinuation.resolve().asClass();
++    WSJoinType =  TypeReference.WSJoin.resolve().asClass();
++    WSFinishFirstType =  TypeReference.WSFinishFirst.resolve().asClass();
++    WSFinishType =  TypeReference.WSFinish.resolve().asClass();
++    RVMThreadType = TypeReference.RVMThread.resolve().asClass();
+   }
+ 
+   /**
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/classloader/TypeReference.java
+--- a/rvm/src/org/jikesrvm/classloader/TypeReference.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/classloader/TypeReference.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -176,6 +176,11 @@
+   public static final TypeReference BaselineSaveLSRegisters = findOrCreate(org.vmmagic.pragma.BaselineSaveLSRegisters.class);
+   public static final TypeReference ReferenceFieldsVary = findOrCreate(org.vmmagic.pragma.ReferenceFieldsVary.class);
+ 
++  public static final TypeReference WSContinuation = findOrCreate(org.jikesrvm.scheduler.WS.Continuation.class);
++  public static final TypeReference WSJoin = findOrCreate(org.jikesrvm.scheduler.WS.Join.class);
++  public static final TypeReference WSFinish = findOrCreate(org.jikesrvm.scheduler.WS.Finish.class);
++  public static final TypeReference WSFinishFirst = findOrCreate(org.jikesrvm.scheduler.WS.FinishFirst.class);
++  public static final TypeReference RVMThread = findOrCreate(org.jikesrvm.scheduler.RVMThread.class);
+ 
+   public static final TypeReference ReferenceMaps =
+       findOrCreate(org.jikesrvm.compilers.baseline.ReferenceMaps.class);
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiledMethod.java
+--- a/rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiledMethod.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiledMethod.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -202,11 +202,12 @@
+    */
+   @Override
+   @Unpreemptible
+-  public int findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType) {
++  public Offset findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType, boolean exactType) {
++
+     if (eTable == null) {
+-      return -1;
++      return Offset.fromIntSignExtend(-1);
+     } else {
+-      return ExceptionTable.findCatchBlockForInstruction(eTable, instructionOffset, exceptionType);
++      return ExceptionTable.findCatchBlockForInstruction(eTable, instructionOffset, exceptionType, exactType);
+     }
+   }
+ 
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiler.java
+--- a/rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiler.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/baseline/BaselineCompiler.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -295,7 +295,7 @@
+         ((BaselineCompiledMethod) compiledMethod).setLockAcquisitionOffset(lockOffset);
+       }
+       ((BaselineCompiledMethod) compiledMethod).encodeMappingInfo(refMaps, bcMap);
+-      compiledMethod.compileComplete(instructions);
++      compiledMethod.compileComplete(instructions, instructions);
+       if (edgeCounterIdx > 0) {
+         EdgeCounts.allocateCounters(method, edgeCounterIdx);
+       }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineExceptionDeliverer.java
+--- a/rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineExceptionDeliverer.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineExceptionDeliverer.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -98,7 +98,7 @@
+                   0)) - BYTES_IN_ADDRESS).loadAddress());
+         }
+         if (ObjectModel.holdsLock(lock, RVMThread.getCurrentThread())) {
+-          ObjectModel.genericUnlock(lock);
++          ObjectModel.genericUnlock_internal(lock);
+         }
+       }
+     }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineGCMapIterator.java
+--- a/rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineGCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/baseline/ia32/BaselineGCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -29,7 +29,8 @@
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.Offset;
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
++import org.jikesrvm.scheduler.RVMThread;
+ 
+ /**
+  * Iterator for stack frame  built by the Baseline compiler.
+@@ -102,7 +103,7 @@
+    *
+    * @param registerLocations locations of saved registers
+    */
+-  public BaselineGCMapIterator(WordArray registerLocations) {
++  public BaselineGCMapIterator(AddressArray registerLocations) {
+     this.registerLocations = registerLocations; // (in superclass)
+     dynamicLink = new DynamicLink();
+   }
+@@ -125,7 +126,7 @@
+    *          processing instance specific information i.e JSR return address
+    *          values
+    */
+-  @Override
++  //@Override
+   public void setupIterator(CompiledMethod compiledMethod, Offset instructionOffset, Address fp) {
+     currentCompiledMethod = (BaselineCompiledMethod) compiledMethod;
+     currentMethod = (NormalMethod) currentCompiledMethod.getMethod();
+@@ -179,7 +180,7 @@
+     bridgeSpilledParamLocation = Address.zero();
+ 
+     if (currentMethod.getDeclaringClass().hasDynamicBridgeAnnotation()) {
+-      Address ip = Magic.getReturnAddressUnchecked(fp);
++      Address ip = Magic.getReturnAddress(fp);
+       fp = Magic.getCallerFramePointer(fp);
+       int callingCompiledMethodId = Magic.getCompiledMethodID(fp);
+       CompiledMethod callingCompiledMethod = CompiledMethods.getCompiledMethod(callingCompiledMethodId);
+@@ -206,7 +207,7 @@
+    * Reset iteration to initial state. This allows a map to be scanned multiple
+    * times.
+    */
+-  @Override
++  //@Override
+   public void reset() {
+     mapIndex = 0;
+     finishedWithRegularMap = false;
+@@ -250,12 +251,31 @@
+     return offset;
+   }
+ 
+-  @Override
++  public final int getNVRegistersSaved() {
++    int result = (1 << EDI.value()) | (1 << EBX.value());
++    if (currentMethod.hasBaselineSaveLSRegistersAnnotation()) {
++      result |= 1 << EBP.value();
++    }
++    return result;
++  }
++
++  public final int getNVObjectMap() {
++    if (currentCompiledMethod.hasCounterArray()) {
++      return 1 << EBX.value();
++    }
++    return 0;
++  }
++  
++  /**
++   * Get location of next reference. A zero return indicates that no more
++   * references exist.
++   */
++  //@Override
+   public Address getNextReferenceAddress() {
+     if (!finishedWithRegularMap) {
+       if (counterArrayBase) {
+         counterArrayBase = false;
+-        return registerLocations.get(EBX.value()).toAddress();
++        return registerLocations.get(EBX.value());
+       }
+       if (mapId < 0) {
+         mapIndex = maps.getNextJSRRefIndex(mapIndex);
+@@ -309,10 +329,10 @@
+       if (!bridgeRegistersLocationUpdated) {
+         // point registerLocations[] to our callers stackframe
+         //
+-        registerLocations.set(EDI.value(), framePtr.plus(EDI_SAVE_OFFSET).toWord());
+-        registerLocations.set(T0.value(), framePtr.plus(T0_SAVE_OFFSET).toWord());
+-        registerLocations.set(T1.value(), framePtr.plus(T1_SAVE_OFFSET).toWord());
+-        registerLocations.set(EBX.value(), framePtr.plus(EBX_SAVE_OFFSET).toWord());
++        registerLocations.set(EDI.value(), framePtr.plus(EDI_SAVE_OFFSET));
++        registerLocations.set(T0.value(), framePtr.plus(T0_SAVE_OFFSET));
++        registerLocations.set(T1.value(), framePtr.plus(T1_SAVE_OFFSET));
++        registerLocations.set(EBX.value(), framePtr.plus(EBX_SAVE_OFFSET));
+ 
+         bridgeRegistersLocationUpdated = true;
+       }
+@@ -380,17 +400,21 @@
+     } else {
+       // point registerLocations[] to our callers stackframe
+       //
+-      registerLocations.set(EDI.value(), framePtr.plus(EDI_SAVE_OFFSET).toWord());
+-      registerLocations.set(EBX.value(), framePtr.plus(EBX_SAVE_OFFSET).toWord());
++      registerLocations.set(EDI.value(), framePtr.plus(EDI_SAVE_OFFSET));
++      registerLocations.set(EBX.value(), framePtr.plus(EBX_SAVE_OFFSET));
+       if (currentMethod.hasBaselineSaveLSRegistersAnnotation()) {
+-        registerLocations.set(EBP.value(), framePtr.plus(EBP_SAVE_OFFSET).toWord());
++        registerLocations.set(EBP.value(), framePtr.plus(EBP_SAVE_OFFSET));
+       }
+     }
+ 
+     return Address.zero();
+   }
+ 
+-  @Override
++  /**
++   * Gets the location of the next return address after the current position. A
++   * zero return indicates that no more references exist
++   */
++  //@Override
+   public Address getNextReturnAddressAddress() {
+     if (mapId >= 0) {
+       if (VM.TraceStkMaps || TRACE_ALL) {
+@@ -414,7 +438,7 @@
+    * ... they may be in temporary storage i.e. storage only used during garbage
+    * collection
+    */
+-  @Override
++  //@Override
+   public void cleanupPointers() {
+     maps.cleanupPointers();
+     maps = null;
+@@ -425,7 +449,7 @@
+     bridgeParameterTypes = null;
+   }
+ 
+-  @Override
++  //@Override
+   public int getType() {
+     return CompiledMethod.BASELINE;
+   }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/common/CompiledMethod.java
+--- a/rvm/src/org/jikesrvm/compilers/common/CompiledMethod.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/common/CompiledMethod.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -32,6 +32,8 @@
+ 
+ /**
+  * A method that has been compiled into machine code by one of our compilers.
++ * We implement SynchronizedObject because we need to synchronize
++ * on the CompiledMethod object as part of the invalidation protocol.
+  */
+ public abstract class CompiledMethod {
+ 
+@@ -86,6 +88,11 @@
+   protected CodeArray instructions;
+ 
+   /**
++   * The compiled machine code for said method.
++   */
++  protected CodeArray joinInstructions;
++
++  /**
+    * the offset of instructions in JTOC, for osr-special compiled
+    * method only. all osr-ed method is treated like static.
+    * TODO: OSR redesign: put in subclass?  Stick somewhere else?
+@@ -204,16 +211,18 @@
+     if (getCompilerType() == JNI || getCompilerType() == TRAP) {
+       return Offset.zero();
+     } else {
+-      Offset offset = ip.diff(Magic.objectAsAddress(instructions));
+-      int max = (instructions.length() + 1) << ArchitectureSpecific.ArchConstants.LG_INSTRUCTION_WIDTH;
++      CodeArray base = instructions;
++      if (inJoinInstructions(ip)) base = joinInstructions;
++      Offset offset = ip.diff(Magic.objectAsAddress(base));
++      int max = (base.length() + 1) << ArchitectureSpecific.ArchConstants.LG_INSTRUCTION_WIDTH;
+       if (!offset.toWord().LT(Word.fromIntZeroExtend(max))) {
+         if (RVMThread.isTrampolineIP(ip)) {
+-          ip = RVMThread.getCurrentThread().getTrampolineHijackedReturnAddress();
+-          offset = ip.diff(Magic.objectAsAddress(instructions));
+-          if (offset.toWord().LT(Word.fromIntZeroExtend(max)))
+-            return offset;
+-        }
+-        Address instructionStart = Magic.objectAsAddress(instructions);
++    		  ip = RVMThread.getCurrentThread().getTrampolineHijackedReturnAddress();
++    		  offset = ip.diff(Magic.objectAsAddress(instructions));
++    		  if (offset.toWord().LT(Word.fromIntZeroExtend(max)))
++    			  return offset;
++   	}
++        Address instructionStart = Magic.objectAsAddress(base);
+         VM.sysWriteln("\nIn thread ",RVMThread.getCurrentThreadSlot()," getInstructionOffset: ip is not within compiled code for method: ",ip);
+         VM.sysWrite("\tsupposed method is ");
+         VM.sysWrite(method);
+@@ -254,6 +263,17 @@
+   }
+ 
+   /**
++   * Return the address of the instruction at offset offset in the method's instruction stream.
++   * @param offset the offset of the desired instruction (as returned by getInstructionOffset)
++   * @return Address of the specified instruction
++   */
++  @Uninterruptible
++  public final Address getInstructionAddress(boolean inJoin, Offset offset) {
++    Address startAddress = Magic.objectAsAddress(inJoin ? joinInstructions : instructions);
++    return startAddress.plus(offset);
++  }
++
++  /**
+    * Return the code array for this method that contains the given offset.
+    * @param offset the offset of the desired instruction (as returned by getInstructionOffset)
+    * @return CodeArray that contains the specified instruction
+@@ -270,6 +290,27 @@
+    */
+   @Uninterruptible
+   public final boolean containsReturnAddress(Address ip) {
++    return inRange(ip, instructions) || inJoinInstructions(ip);
++  }
++
++  @Uninterruptible
++  public final boolean inJoinInstructions(Address ip) {
++    return joinInstructions != null && inRange(ip, joinInstructions);
++  }
++
++  @Uninterruptible
++  public final boolean hasJoinInstructions() {
++    return joinInstructions != null && joinInstructions != instructions;
++  }
++
++
++  @Uninterruptible
++  public final Offset joinDelta() {
++    return Magic.objectAsAddress(joinInstructions).diff(Magic.objectAsAddress(instructions));
++  }
++  
++  @Uninterruptible
++  private static final boolean inRange(Address ip, CodeArray instructions) {
+     Address beg = Magic.objectAsAddress(instructions);
+     Address end = beg.plus(instructions.length() << ArchitectureSpecific.ArchConstants.LG_INSTRUCTION_WIDTH);
+ 
+@@ -285,8 +326,9 @@
+    *
+    * @param code the method's code
+    */
+-  public final void compileComplete(CodeArray code) {
++  public final void compileComplete(CodeArray code, CodeArray joinCode) {
+     instructions = code;
++    joinInstructions = joinCode;
+     flags |= COMPILED;
+   }
+ 
+@@ -363,7 +405,7 @@
+   }
+ 
+   public final double getCompilationTime() {
+-    return compilationTime;
++    return (double) compilationTime;
+   }
+ 
+   public final void setCompilationTime(double ct) {
+@@ -410,7 +452,8 @@
+   /**
+    * Find "catch" block for a machine instruction of
+    * this method that might be guarded
+-   * against specified class of exceptions by a "try" block.<p>
++   * against specified class of exceptions by a "try" block .
++   *
+    *
+    * Notes:
+    * <ul>
+@@ -438,11 +481,15 @@
+    * (-1 --&gt; no catch block)
+    */
+   @Unpreemptible
+-  public abstract int findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType);
++  public abstract Offset findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType, boolean exactType);
+ 
+   /**
+    * Fetch symbolic reference to a method that's called by one of
+-   * this method's instructions.<p>
++   * this method's instructions.<p>.
++   * this method's instructions.
++   * @param dynamicLink place to put return information
++   * @param instructionOffset offset of machine instruction from start of
++   * this method, in bytes
+    *
+    * Notes:
+    * <ul>
+@@ -462,9 +509,6 @@
+    * GC disabled when called by GCMapIterator.
+    * </ul>
+    *
+-   * @param dynamicLink place to put return information
+-   * @param instructionOffset offset of machine instruction from start of
+-   * this method, in bytes
+    */
+   @Uninterruptible
+   public abstract void getDynamicLink(DynamicLink dynamicLink, Offset instructionOffset);
+@@ -472,6 +516,9 @@
+   /**
+    * Find source line number corresponding to one of this method's
+    * machine instructions.
++   * @param instructionOffset of machine instruction from start of this method, in bytes
++   * @return source line number
++   * (0 == no line info available, 1 == first line of source file)
+    *
+    * <p> Usage note: "instructionOffset" must point to the
+    * instruction <em> following </em> the actual instruction
+@@ -487,10 +534,6 @@
+    * instruction pointer
+    * to point to the "call site" or "exception site".
+    *
+-   * @param instructionOffset of machine instruction from start of this method, in bytes
+-   * @return source line number
+-   * (0 == no line info available, 1 == first line of source file, -2 == native method))
+-   *
+    */
+   @Uninterruptible
+   public int findLineNumberForInstruction(Offset instructionOffset) {
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/common/ExceptionTable.java
+--- a/rvm/src/org/jikesrvm/compilers/common/ExceptionTable.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/common/ExceptionTable.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -20,6 +20,8 @@
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.pragma.Unpreemptible;
+ import org.vmmagic.unboxed.Offset;
++import org.vmmagic.pragma.UninterruptibleNoWarn;
++import org.vmmagic.pragma.UnpreemptibleNoWarn;
+ 
+ /**
+  * Encoding of try ranges in the final machinecode and the
+@@ -42,10 +44,11 @@
+    * @param eTable the encoded exception table to search
+    * @param instructionOffset the offset of the instruction after the PEI.
+    * @param exceptionType the type of exception that was raised
++   * @param exactType only match exact exception types.
+    * @return the machine code offset of the catch block.
+    */
+   @Unpreemptible
+-  public static int findCatchBlockForInstruction(int[] eTable, Offset instructionOffset, RVMType exceptionType) {
++  public static Offset findCatchBlockForInstruction(int[] eTable, Offset instructionOffset, RVMType exceptionType, boolean exactType) {
+     for (int i = 0, n = eTable.length; i < n; i += 4) {
+       // note that instructionOffset points to the instruction after the PEI
+       // so the range check here must be "offset >  beg && offset <= end"
+@@ -56,16 +59,16 @@
+           instructionOffset.sLE(Offset.fromIntSignExtend(eTable[i + TRY_END]))) {
+         RVMType lhs = RVMType.getType(eTable[i + EX_TYPE]);
+         if (lhs == exceptionType) {
+-          return eTable[i + CATCH_START];
+-        } else if (lhs.isInitialized()) {
++          return Offset.fromIntSignExtend(eTable[i + CATCH_START]);
++        } else if (!exactType && lhs.isInitialized()) {
+           TIB rhsTIB = exceptionType.getTypeInformationBlock();
+           if (DynamicTypeCheck.instanceOfClass(lhs.asClass(), rhsTIB)) {
+-            return eTable[i + CATCH_START];
++            return Offset.fromIntSignExtend(eTable[i + CATCH_START]);
+           }
+         }
+       }
+     }
+-    return -1;
++    return Offset.fromIntSignExtend(-1);
+   }
+ 
+   /**
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/common/HardwareTrapCompiledMethod.java
+--- a/rvm/src/org/jikesrvm/compilers/common/HardwareTrapCompiledMethod.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/common/HardwareTrapCompiledMethod.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -56,8 +56,8 @@
+ 
+   @Override
+   @Unpreemptible
+-  public int findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType) {
+-    return -1;
++  public Offset findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType, boolean exactType) {
++    return Offset.fromIntSignExtend(-1);
+   }
+ 
+   @Override
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/common/HardwareTrapGCMapIterator.java
+--- a/rvm/src/org/jikesrvm/compilers/common/HardwareTrapGCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/common/HardwareTrapGCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -20,7 +20,7 @@
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.Offset;
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ 
+ /**
+  * Iterator for stack frames inserted by hardware trap handler.
+@@ -30,7 +30,7 @@
+ @Uninterruptible
+ public final class HardwareTrapGCMapIterator extends GCMapIterator {
+ 
+-  public HardwareTrapGCMapIterator(WordArray registerLocations) {
++  public HardwareTrapGCMapIterator(AddressArray registerLocations) {
+     this.registerLocations = registerLocations;
+   }
+ 
+@@ -39,6 +39,18 @@
+     this.framePtr = framePtr;
+   }
+ 
++  public final int getNVRegistersSaved() {
++    int result = 0;
++    for (int i=0; i< ArchitectureSpecific.ArchConstants.NONVOLATILE_GPRS.length; i++) {
++      result |= (1 << ArchitectureSpecific.ArchConstants.NONVOLATILE_GPRS[i].value());
++    }
++    return result;
++  }
++
++  public final int getNVObjectMap() {
++    return 0;
++  }
++
+   @Override
+   public Address getNextReferenceAddress() {
+     // update register locations, noting that the trap handler represented by this stackframe
+@@ -46,7 +58,7 @@
+     //
+     Address registerLocation = Magic.objectAsAddress(thread.getExceptionRegisters().gprs);
+     for (int i = 0; i < ArchitectureSpecific.ArchConstants.NUM_GPRS; ++i) {
+-      registerLocations.set(i, registerLocation.toWord());
++      registerLocations.set(i, registerLocation);
+       registerLocation = registerLocation.plus(BYTES_IN_ADDRESS);
+     }
+     return Address.zero();
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/driver/OptimizingCompiler.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/driver/OptimizingCompiler.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/driver/OptimizingCompiler.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -181,7 +181,7 @@
+       // system a chance to eagerly compile any specialized version
+       // that are pending.  TODO: use lazy compilation with specialization.
+       SpecializationDatabase.doDeferredSpecializations();
+-      ir.compiledMethod.compileComplete(ir.MIRInfo.machinecode);
++      ir.compiledMethod.compileComplete(ir.MIRInfo.fastmachinecode, ir.MIRInfo.machinecode);
+       return ir.compiledMethod;
+     } catch (OptimizingCompilerException e) {
+       throw e;
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/ir/MIRInfo.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/ir/MIRInfo.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/ir/MIRInfo.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -29,6 +29,11 @@
+   public CodeArray machinecode;
+ 
+   /**
++   * The generated machinecodes produced by this compilation of 'method'
++   */
++  public CodeArray fastmachinecode;
++
++  /**
+    * Estimate produced by FinalMIRExpansion and used by
+    * Assembler to create code array; only meaningful on PowerPC
+    */
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/mir2mc/ia32/AssemblerBase.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/mir2mc/ia32/AssemblerBase.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/mir2mc/ia32/AssemblerBase.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -1172,6 +1172,7 @@
+     }
+ 
+     ir.MIRInfo.machinecode = getMachineCodes();
++    ir.MIRInfo.fastmachinecode = patchMachineCodeForWorkStealing(ir.MIRInfo.machinecode);
+ 
+     return ir.MIRInfo.machinecode.length();
+   }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptCompiledMethod.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptCompiledMethod.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptCompiledMethod.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -80,13 +80,13 @@
+    */
+   @Override
+   @Unpreemptible
+-  public int findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType) {
++  public Offset findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType, boolean exactType) {
+     if (eTable == null) {
+-      return -1;
++      return Offset.fromIntSignExtend(-1);
+     } else {
+-      int catchOffset = ExceptionTable.findCatchBlockForInstruction(eTable, instructionOffset, exceptionType);
++      Offset catchOffset = ExceptionTable.findCatchBlockForInstruction(eTable, instructionOffset, exceptionType, exactType);
+       dealWithPossibleRemovalOfCatchBlockByTheOptCompiler(instructionOffset,
+-          exceptionType, catchOffset);
++          exceptionType, catchOffset.toInt());
+       return catchOffset;
+     }
+   }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptGenericGCMapIterator.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptGenericGCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/OptGenericGCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -25,7 +25,7 @@
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.Offset;
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ 
+ /**
+  * This class contains its architecture-independent code for iteration
+@@ -84,7 +84,7 @@
+   static final boolean lookForMissedReferencesInSpills = false;
+ 
+   // Constructor
+-  protected OptGenericGCMapIterator(WordArray registerLocations) {
++  protected OptGenericGCMapIterator(AddressArray registerLocations) {
+     super();
+     this.registerLocations = registerLocations;
+   }
+@@ -179,6 +179,34 @@
+     }
+   }
+ 
++  public final int getNVRegistersSaved() {
++    int result = 0;
++    int frameOffset = compiledMethod.getUnsignedNonVolatileOffset();
++    if (frameOffset >= 0) {
++      int first = compiledMethod.getFirstNonVolatileGPR();
++      if (first >= 0) {
++        for (int i = first; i < NUM_NONVOLATILE_GPRS; i++) {
++          result |= (1 << NONVOLATILE_GPRS[i].value());
++        }
++      }
++    }
++    return result;
++  }
++
++  public final int getNVObjectMap() {
++    int result = 0;
++    if (mapIndex == OptGCMap.NO_MAP_ENTRY) {
++      return 0;
++    }
++    for(int i=0; i < NONVOLATILE_GPRS.length; i++) {
++      int reg = NONVOLATILE_GPRS[i].value();
++      if (map.registerIsSet(mapIndex, reg)) {
++        result |= (1 << reg);
++      }
++    }
++    return result;
++  }
++
+   /**
+    * Returns the next address that contains a reference
+    * @return the value of the next reference
+@@ -218,7 +246,7 @@
+       if (currentRegisterIsValid()) {
+         Address regLocation;
+         // currentRegister contains a reference, return that location
+-        regLocation = registerLocations.get(getCurrentRegister()).toAddress();
++        regLocation = registerLocations.get(getCurrentRegister());
+         if (DEBUG) {
+           VM.sysWrite(" *** Ref found in reg#");
+           VM.sysWrite(getCurrentRegister());
+@@ -417,7 +445,7 @@
+    */
+   final void checkRegistersForMissedReferences(int firstReg, int lastReg) {
+     for (int i = firstReg; i <= lastReg; i++) {
+-      Address regLocation = registerLocations.get(i).toAddress();
++      Address regLocation = registerLocations.get(i);
+       Address regValue = regLocation.loadAddress();
+       if (MemoryManager.addressInVM(regValue)) {
+         VM.sysWrite("  reg#", getCurrentRegister());
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/compilers/opt/runtimesupport/ia32/OptGCMapIterator.java
+--- a/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/ia32/OptGCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/compilers/opt/runtimesupport/ia32/OptGCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -19,7 +19,7 @@
+ import org.jikesrvm.ia32.StackframeLayoutConstants;
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ 
+ /**
+  * An instance of this class provides iteration across the references
+@@ -34,7 +34,7 @@
+ 
+   private static final boolean DEBUG = false;
+ 
+-  public OptGCMapIterator(WordArray registerLocations) {
++  public OptGCMapIterator(AddressArray registerLocations) {
+     super(registerLocations);
+   }
+ 
+@@ -86,7 +86,7 @@
+         for (int i = first; i < NUM_NONVOLATILE_GPRS; i++) {
+           // determine what register index corresponds to this location
+           int registerIndex = NONVOLATILE_GPRS[i].value();
+-          registerLocations.set(registerIndex, location.toWord());
++          registerLocations.set(registerIndex, location);
+           if (DEBUG) {
+             VM.sysWrite("UpdateRegisterLocations: Register ");
+             VM.sysWrite(registerIndex);
+@@ -106,7 +106,7 @@
+         for (int i = 0; i < NUM_VOLATILE_GPRS; i++) {
+           // determine what register index corresponds to this location
+           int registerIndex = VOLATILE_GPRS[i].value();
+-          registerLocations.set(registerIndex, location.toWord());
++          registerLocations.set(registerIndex, location);
+           if (DEBUG) {
+             VM.sysWrite("UpdateRegisterLocations: Register ");
+             VM.sysWrite(registerIndex);
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/ia32/OutOfLineMachineCode.java
+--- a/rvm/src/org/jikesrvm/ia32/OutOfLineMachineCode.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/ia32/OutOfLineMachineCode.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -543,7 +543,7 @@
+     Assembler asm = new ArchitectureSpecific.Assembler(0);
+ 
+     /* push the hijacked return address (which is held in thread-local state) */
+-    asm.emitPUSH_RegDisp(TR, ArchEntrypoints.hijackedReturnAddressField.getOffset());
++    //asm.emitPUSH_RegDisp(TR, ArchEntrypoints.hijackedReturnAddressField.getOffset());
+ 
+     /* push the GPRs and fp */
+     for (int i = 0; i < NUM_GPRS; i++) {
+@@ -560,6 +560,18 @@
+       asm.emitPOP_Reg(ALL_GPRS[i]);
+     }
+ 
++    /*
++     * When doing Try-Catch work-stealing, it might be the case that the victim is intended to
++     * return to an address A from the return barrier, but once it has branched into the 
++     * return barrier it finds that now that return address A is no more valid
++     * as it has been stolen. Now in this case it should not return to A and instead
++     * return to some new address B. This change is possible only if the return address
++     * is PUSH at this point and not in the begining of this call --  generateStackTrampolineBridgeInstructions().
++     */
++    
++    /* push the hijacked return address (which is held in thread-local state) */
++    asm.emitPUSH_RegDisp(TR, ArchEntrypoints.hijackedReturnAddressField.getOffset());
++
+     /* pop the hijacked return address and return */
+     asm.emitRET();
+ 
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/jni/JNICompiledMethod.java
+--- a/rvm/src/org/jikesrvm/jni/JNICompiledMethod.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/jni/JNICompiledMethod.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -95,8 +95,8 @@
+ 
+   @Override
+   @Unpreemptible
+-  public int findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType) {
+-    return -1;
++  public Offset findCatchBlockForInstruction(Offset instructionOffset, RVMType exceptionType, boolean exactType) {
++    return Offset.fromIntSignExtend(-1);
+   }
+ 
+   @Override
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/jni/JNIFunctions.java
+--- a/rvm/src/org/jikesrvm/jni/JNIFunctions.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/jni/JNIFunctions.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -5697,7 +5697,7 @@
+ 
+     try {
+       Object obj = env.getJNIRef(objJREF);
+-      ObjectModel.genericLock(obj);
++      ObjectModel.genericLock_internal(obj);
+       return 0;
+     } catch (Throwable unexpected) {
+       if (traceJNI) unexpected.printStackTrace(System.err);
+@@ -5717,7 +5717,7 @@
+ 
+     try {
+       Object obj = env.getJNIRef(objJREF);
+-      ObjectModel.genericUnlock(obj);
++      ObjectModel.genericUnlock_internal(obj);
+       return 0;
+     } catch (Throwable unexpected) {
+       if (traceJNI) unexpected.printStackTrace(System.err);
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/jni/ia32/JNICompiler.java
+--- a/rvm/src/org/jikesrvm/jni/ia32/JNICompiler.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/jni/ia32/JNICompiler.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -560,7 +560,7 @@
+     }
+ 
+     MachineCode machineCode = new ArchitectureSpecific.MachineCode(asm.getMachineCodes(), null);
+-    cm.compileComplete(machineCode.getInstructions());
++    cm.compileComplete(machineCode.getInstructions(), machineCode.getInstructions());
+     return cm;
+   }
+ 
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/jni/ia32/JNIGCMapIterator.java
+--- a/rvm/src/org/jikesrvm/jni/ia32/JNIGCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/jni/ia32/JNIGCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -25,7 +25,6 @@
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.AddressArray;
+ import org.vmmagic.unboxed.Offset;
+-import org.vmmagic.unboxed.WordArray;
+ 
+ /**
+  * Iterator for stack frames inserted at the transition from Java to
+@@ -63,9 +62,17 @@
+   int jniNextRef;
+   int jniFramePtr;
+ 
+-  public JNIGCMapIterator(WordArray registerLocations) {
++  public JNIGCMapIterator(AddressArray registerLocations) {
+     this.registerLocations = registerLocations;
+   }
++  
++  public final int getNVRegistersSaved() {
++    return (1 << EDI.value()) | (1 << EBX.value()) | (1 << EBP.value());
++  }
++
++  public final int getNVObjectMap() {
++    return 0;
++  }
+ 
+   // Override newStackWalk() in parent class GCMapIterator to
+   // initialize iterator for scan of JNI JREFs stack of refs
+@@ -123,9 +130,9 @@
+     // the JNI transition frame at a fixed negative offset from the callers FP.
+     // the save non-volatiles are EBX EBP and EDI.
+     //
+-    registerLocations.set(EDI.value(), framePtr.plus(JNICompiler.EDI_SAVE_OFFSET).toWord());
+-    registerLocations.set(EBX.value(), framePtr.plus(JNICompiler.EBX_SAVE_OFFSET).toWord());
+-    registerLocations.set(EBP.value(), framePtr.plus(JNICompiler.EBP_SAVE_OFFSET).toWord());
++    registerLocations.set(EDI.value(), framePtr.plus(JNICompiler.EDI_SAVE_OFFSET));
++    registerLocations.set(EBX.value(), framePtr.plus(JNICompiler.EBX_SAVE_OFFSET));
++    registerLocations.set(EBP.value(), framePtr.plus(JNICompiler.EBP_SAVE_OFFSET));
+ 
+     return Address.zero();  // no more refs to report
+   }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/mm/mminterface/GCMapIterator.java
+--- a/rvm/src/org/jikesrvm/mm/mminterface/GCMapIterator.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/mm/mminterface/GCMapIterator.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -17,7 +17,7 @@
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
+ import org.vmmagic.unboxed.Offset;
+-import org.vmmagic.unboxed.WordArray;
++import org.vmmagic.unboxed.AddressArray;
+ 
+ /**
+  * Base class for iterators that identify object references and JSR return addresses
+@@ -36,7 +36,7 @@
+   protected Address framePtr;
+ 
+   /** address where each gpr register was saved by previously scanned stackframe(s) */
+-  protected WordArray registerLocations;
++  protected AddressArray registerLocations;
+ 
+   /**
+    * Prepare to scan a thread's stack and saved registers for object references.
+@@ -89,6 +89,10 @@
+    * locks acquired during setupIterator for jsr maps.
+    */
+   public abstract void cleanupPointers();
++ 
++  public abstract int getNVRegistersSaved();
++
++  public abstract int getNVObjectMap();
+ 
+   /**
+    * Get the type of this iterator (BASELINE, OPT, etc.).
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/mm/mminterface/GCMapIteratorGroup.java
+--- a/rvm/src/org/jikesrvm/mm/mminterface/GCMapIteratorGroup.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/mm/mminterface/GCMapIteratorGroup.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -24,6 +24,9 @@
+ import org.jikesrvm.scheduler.RVMThread;
+ import org.vmmagic.pragma.Uninterruptible;
+ import org.vmmagic.unboxed.Address;
++import org.vmmagic.unboxed.AddressArray;
++import org.vmmagic.unboxed.Offset;
++import org.vmmagic.unboxed.Word;
+ import org.vmmagic.unboxed.WordArray;
+ 
+ /**
+@@ -45,7 +48,7 @@
+ public final class GCMapIteratorGroup {
+ 
+   /** current location (memory address) of each gpr register */
+-  private final WordArray registerLocations;
++  private final AddressArray registerLocations;
+ 
+   /** iterator for baseline compiled frames */
+   private final GCMapIterator baselineIterator;
+@@ -60,7 +63,7 @@
+   private final GCMapIterator jniIterator;
+ 
+   public GCMapIteratorGroup() {
+-    registerLocations = WordArray.create(ArchitectureSpecific.ArchConstants.NUM_GPRS);
++    registerLocations = AddressArray.create(ArchitectureSpecific.ArchConstants.NUM_GPRS);
+ 
+     baselineIterator = new BaselineGCMapIterator(registerLocations);
+     if (VM.BuildForOptCompiler) {
+@@ -72,6 +75,18 @@
+     hardwareTrapIterator = new HardwareTrapGCMapIterator(registerLocations);
+   }
+ 
++  @Uninterruptible
++  public void dump() {
++    VM.sysWrite("GCMapIteratorGroup: registerLocations:");
++    for(int i=0; i<ArchitectureSpecific.ArchConstants.NUM_GPRS; i++)  {
++      VM.sysWrite("[",i,"] = ");
++      VM.sysWrite(registerLocations.get(i));
++      VM.sysWrite(":",registerLocations.get(i).loadWord());
++      VM.sysWrite(" ");
++    }
++    VM.sysWriteln();
++  }
++
+   /**
+    * Prepare to scan a thread's stack for object references.
+    * Called by collector threads when beginning to scan a threads stack.
+@@ -90,7 +105,7 @@
+   @Uninterruptible
+   public void newStackWalk(RVMThread thread, Address registerLocation) {
+     for (int i = 0; i < ArchitectureSpecific.ArchConstants.NUM_GPRS; ++i) {
+-      registerLocations.set(i, registerLocation.toWord());
++      registerLocations.set(i, registerLocation);
+       registerLocation = registerLocation.plus(BYTES_IN_ADDRESS);
+     }
+     baselineIterator.newStackWalk(thread);
+@@ -102,6 +117,24 @@
+   }
+ 
+   /**
++   * Copy out the current register values from register location information.
++   *
++   * @param registerLocation Where to copy the values to.
++   */
++  @Uninterruptible
++  public void copyRegisterValues(Address registerLocation) {
++    for (int i = 0; i < ArchitectureSpecific.ArchConstants.NUM_GPRS; ++i) {
++      registerLocation.store(registerLocations.get(i).loadWord());
++      registerLocation = registerLocation.plus(BYTES_IN_ADDRESS);
++    }
++  }
++
++  @Uninterruptible
++  public Address getRegisterLocation(int reg) {
++    return registerLocations.get(reg);
++  }
++
++  /**
+    * Select iterator for scanning for object references in a stackframe.
+    * Called by collector threads while scanning a threads stack.
+    *
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/objectmodel/ObjectModel.java
+--- a/rvm/src/org/jikesrvm/objectmodel/ObjectModel.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/objectmodel/ObjectModel.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -37,6 +37,7 @@
+ import org.vmmagic.unboxed.ObjectReference;
+ import org.vmmagic.unboxed.Offset;
+ import org.vmmagic.unboxed.Word;
++import org.jikesrvm.scheduler.WS;
+ 
+ /**
+  * The interface to the object model definition accessible to the
+@@ -556,6 +557,7 @@
+   @Entrypoint
+   @Unpreemptible("Become another thread when lock is contended, don't preempt in other cases")
+   public static void genericLock(Object o) {
++    WS.pauseStealOnThread();
+     JavaHeader.genericLock(o);
+   }
+ 
+@@ -563,6 +565,25 @@
+   @Unpreemptible("No preemption normally, but may raise exceptions")
+   public static void genericUnlock(Object o) {
+     JavaHeader.genericUnlock(o);
++    WS.resumeStealOnThread();
++  }
++
++  /**
++   * Generic lock - Work-Stealing Specific
++   */
++  @Entrypoint
++  @Unpreemptible("Become another thread when lock is contended, don't preempt in other cases")
++  public static void genericLock_internal(Object o) {
++    JavaHeader.genericLock(o);
++  }
++
++  /**
++   * Generic lock - Work-Stealing Specific
++   */
++  @Entrypoint
++  @Unpreemptible("No preemption normally, but may raise exceptions")
++  public static void genericUnlock_internal(Object o) {
++    JavaHeader.genericUnlock(o);
+   }
+ 
+   /**
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/ArchEntrypoints.java
+--- a/rvm/src/org/jikesrvm/runtime/ArchEntrypoints.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/ArchEntrypoints.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -46,7 +46,7 @@
+   public static final RVMField trampolineRegistersField =
+         EntrypointHelper.getField("Lorg/jikesrvm/scheduler/RVMThread;", "trampolineRegisters", "Lorg/jikesrvm/ArchitectureSpecific$Registers;");
+   public static final RVMField hijackedReturnAddressField =
+-    EntrypointHelper.getField("Lorg/jikesrvm/scheduler/RVMThread;", "hijackedReturnAddress", "Lorg/vmmagic/unboxed/Address;");
++    EntrypointHelper.getField("Lorg/jikesrvm/scheduler/RVMThread;", "hijackedReturnAddress_original", "Lorg/vmmagic/unboxed/Address;");
+   public static final RVMField registersIPField =
+       EntrypointHelper.getField("Lorg/jikesrvm/" + arch + "/Registers;", "ip", "Lorg/vmmagic/unboxed/Address;");
+   public static final RVMField registersFPRsField = EntrypointHelper.getField("Lorg/jikesrvm/" + arch + "/Registers;", "fprs", "[D");
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/BootRecord.java
+--- a/rvm/src/org/jikesrvm/runtime/BootRecord.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/BootRecord.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -253,6 +253,11 @@
+   public Address sysNumProcessorsIP;
+   public Address sysThreadBindSupportedIP;
+   public Address sysThreadBindIP;
++  public Address sysThreadBindMaskSetIP;
++  public Address wsIniatilizeSysThreadBindMaskIP;
++  public Address wsThreadBindMaskSetIP;
++  public Address sysCheckNUMAnodeIP;
++  public Address sysGetCPUIP;
+   public Address sysThreadCreateIP;
+   public Address sysThreadYieldIP;
+   public Address sysGetThreadIdIP;
+@@ -381,4 +386,13 @@
+   public Address sysPerfEventDisableIP;
+   public Address sysPerfEventReadIP;
+ 
++  // per thread perf event support
++  public Address sysPerfEventInit_threadIP;
++  public Address sysPerfEventCreate_threadIP;
++  public Address sysPerfEventOpen_threadIP;
++  public Address sysPerfEventClose_threadIP;
++  public Address sysPerfEventEnable_threadIP;
++  public Address sysPerfEventDisable_threadIP;
++  public Address sysPerfEventRead_threadIP;
++
+ }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/Entrypoints.java
+--- a/rvm/src/org/jikesrvm/runtime/Entrypoints.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/Entrypoints.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -19,6 +19,7 @@
+ import org.jikesrvm.classloader.RVMField;
+ import org.jikesrvm.classloader.RVMMethod;
+ import org.jikesrvm.classloader.NormalMethod;
++import org.jikesrvm.classloader.MemberReference;
+ 
+ /**
+  * Fields and methods of the virtual machine that are needed by
+@@ -250,6 +251,8 @@
+   public static final RVMField lockThreadField =
+       getField(org.jikesrvm.mm.mmtk.Lock.class, "thread", org.jikesrvm.scheduler.RVMThread.class);
+   */
++  public static final RVMField wsFinishCountField = getField(org.jikesrvm.scheduler.WS.FinishInfo.class, "count", int.class);
++  public static final RVMField wsFinishDataField = getField(org.jikesrvm.scheduler.WS.FinishInfo.class, "data", org.jikesrvm.scheduler.WS.FinishData.class);
+   public static final RVMField lockStateField = getField(org.jikesrvm.mm.mmtk.Lock.class, "state", int.class);
+   public static final RVMField gcStatusField = getField(org.mmtk.plan.Plan.class, "gcStatus", int.class);
+   public static final RVMField SQCFField = getField(org.mmtk.utility.deque.SharedDeque.class, "completionFlag", int.class);
+@@ -373,6 +376,11 @@
+   public static final NormalMethod modifyCheckMethod =
+       getMethod(org.jikesrvm.mm.mminterface.MemoryManager.class, "modifyCheck", "(Ljava/lang/Object;)V");
+ 
++  public static final MemberReference workStealingJoinMethod =
++    getMethod(org.jikesrvm.scheduler.WS.class, "join", "()V").getMemberRef();
++  public static final MemberReference workStealingFinishMethod =
++    getMethod(org.jikesrvm.scheduler.WS.class, "finish", "()V").getMemberRef();
++
+   // used in boot image writer
+   public static final RVMField debugRequestedField =
+       getField(org.jikesrvm.scheduler.RVMThread.class, "debugRequested", boolean.class);
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/Magic.java
+--- a/rvm/src/org/jikesrvm/runtime/Magic.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/Magic.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -188,6 +188,11 @@
+     return getReturnAddress(fp, RVMThread.getCurrentThread());
+   }
+ 
++  @Uninterruptible
++  public static Address getReturnAddress_debug(Address fp) {
++    return getReturnAddress_debug(fp, RVMThread.getCurrentThread());
++  }
++
+   /**
+    * Get return address for a frame in a specific thread
+    *
+@@ -204,6 +209,17 @@
+       return ip;
+   }
+ 
++   @Uninterruptible
++  public static Address getReturnAddress_debug(Address fp, RVMThread thread) {
++    Address ip = getReturnAddressLocation(fp).loadAddress();
++    if (RVMThread.isTrampolineIP(ip)) {
++    	VM.sysWrite("<H>");
++    	return thread.getTrampolineHijackedReturnAddress();
++    }
++    else
++      return ip;
++  }
++
+   /**
+    * Sets return address for a frame.
+    * @param fp its frame pointer
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/RuntimeEntrypoints.java
+--- a/rvm/src/org/jikesrvm/runtime/RuntimeEntrypoints.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/RuntimeEntrypoints.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -692,12 +692,16 @@
+   @Entrypoint
+   @UnpreemptibleNoWarn
+   static void deliverHardwareException(int trapCode, int trapInfo) {
+-    if (false) VM.sysWriteln("delivering hardware exception");
++    if (true) VM.sysWriteln("delivering hardware exception");
+     RVMThread myThread = RVMThread.getCurrentThread();
+-    if (false) VM.sysWriteln("we have a thread = ",Magic.objectAsAddress(myThread));
+-    if (false) VM.sysWriteln("it's in state = ",myThread.getExecStatus());
++    if (true) {
++    	VM.sysWriteln("we have a thread = ",Magic.objectAsAddress(myThread));
++    	VM.sysWriteln("The thread id = ",myThread.getId());
++    }
++    if (true) VM.sysWriteln("it's in state = ",myThread.getExecStatus());
++    RVMThread.dumpWSDetailsWhileDeliveringHardwareException();
+     Registers exceptionRegisters = myThread.getExceptionRegisters();
+-    if (false) VM.sysWriteln("we have exception registers = ",Magic.objectAsAddress(exceptionRegisters));
++    if (true) VM.sysWriteln("we have exception registers = ",Magic.objectAsAddress(exceptionRegisters));
+ 
+     if ((trapCode == TRAP_STACK_OVERFLOW || trapCode == TRAP_JNI_STACK) &&
+         myThread.getStack().length < (STACK_SIZE_MAX >> LOG_BYTES_IN_ADDRESS) &&
+@@ -1012,7 +1016,7 @@
+    * @param exceptionRegisters register state corresponding to exception site
+    */
+   @Unpreemptible("Deliver exception trying to avoid preemption")
+-  private static void deliverException(Throwable exceptionObject, Registers exceptionRegisters) {
++  public static void deliverException(Throwable exceptionObject, Registers exceptionRegisters) {
+     if (VM.TraceExceptionDelivery) {
+       VM.sysWriteln("RuntimeEntrypoints.deliverException() entered; just got an exception object.");
+     }
+@@ -1035,13 +1039,14 @@
+       }
+       int compiledMethodId = Magic.getCompiledMethodID(fp);
+       if (compiledMethodId != INVISIBLE_METHOD_ID) {
+-        CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++	CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
+         ExceptionDeliverer exceptionDeliverer = compiledMethod.getExceptionDeliverer();
+         Address ip = exceptionRegisters.getInnermostInstructionAddress();
++        boolean inJoin = compiledMethod.inJoinInstructions(ip);
+         Offset ipOffset = compiledMethod.getInstructionOffset(ip);
+-        int catchBlockOffset = compiledMethod.findCatchBlockForInstruction(ipOffset, exceptionType);
++        Offset catchBlockOffset = compiledMethod.findCatchBlockForInstruction(ipOffset, exceptionType, false);
+ 
+-        if (catchBlockOffset >= 0) {
++        if (catchBlockOffset.sGE(Offset.zero())) {
+           // found an appropriate catch block
+           if (VM.TraceExceptionDelivery) {
+             VM.sysWriteln("found one; delivering.");
+@@ -1051,7 +1056,7 @@
+             if (RVMThread.DEBUG_STACK_TRAMPOLINE) VM.sysWriteln("leapfrogged...");
+             t.deInstallStackTrampoline();
+           }
+-          Address catchBlockStart = compiledMethod.getInstructionAddress(Offset.fromIntSignExtend(catchBlockOffset));
++          Address catchBlockStart = compiledMethod.getInstructionAddress(inJoin, catchBlockOffset);
+           exceptionDeliverer.deliverException(compiledMethod, catchBlockStart, exceptionObject, exceptionRegisters);
+           if (VM.VerifyAssertions) VM._assert(NOT_REACHED);
+         }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/runtime/SysCall.java
+--- a/rvm/src/org/jikesrvm/runtime/SysCall.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/runtime/SysCall.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -56,6 +56,23 @@
+     }
+   }
+ 
++  /*
++   * Thread Pinning Support for JavaWS (Try-Catch) Work-Stealing
++   * From here---->
++   */
++  @SysCallTemplate
++  public abstract void wsThreadBindMaskSet(int cpuMask);
++  @SysCallTemplate
++  public abstract void sysThreadBindMaskSet();
++  @SysCallTemplate
++  public abstract void wsIniatilizeSysThreadBindMask(int cpuMask);
++  @SysCallTemplate
++  public abstract int sysGetCPU();
++  /*
++   * Thread Pinning Support for JavaWS (Try-Catch) Work-Stealing
++   * Till here <----
++   */
++
+   // lowlevel write to console
+   @SysCallTemplate
+   public abstract void sysConsoleWriteChar(char v);
+@@ -125,6 +142,26 @@
+   public abstract void sysSyncCache(Address address, int size);
+ 
+   /*
++   * Interface to per thred performance events
++   */
++  @SysCallTemplate
++  public abstract int sysCheckNUMAnode(Address location);
++  @SysCallTemplate
++  public abstract int sysPerfEventInit_thread(int events);
++  @SysCallTemplate
++  public abstract int sysPerfEventCreate_thread(int id, byte[] name);
++  @SysCallTemplate
++  public abstract void sysPerfEventClose_thread(int id, int[] fds);
++  @SysCallTemplate
++  public abstract void sysPerfEventOpen_thread(int id, Word tid, int[] fds);
++  @SysCallTemplate
++  public abstract int sysPerfEventEnable_thread(int[] fds, int n);
++  @SysCallTemplate
++  public abstract void sysPerfEventDisable_thread(int[] fds, int n);
++  @SysCallTemplate
++  public abstract int sysPerfEventRead_thread(int id, int[] fds, long[] values);
++
++  /*
+    * Interface to performance events
+    */
+   @SysCallTemplate
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/scheduler/MainThread.java
+--- a/rvm/src/org/jikesrvm/scheduler/MainThread.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/scheduler/MainThread.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -147,6 +147,17 @@
+ 
+     if (dbg) VM.sysWriteln("MainThread.run() starting ");
+ 
++    // Work-Stealing
++    if(RVMThread.autogenWSThread && !RVMThread.wsThreadsLaunched) {
++    	RVMThread.wsThreadsLaunched = true;
++    	Runnable tRun = new Runnable() {
++    		public void run() { WS.workerMain(); }
++    	};
++    	WS.register();
++    	for(int i=0; i<WS.wsProcs-1; i++) {
++    		new Thread(tRun).start();
++    	}
++    }
+     // Set up application class loader
+     ClassLoader cl = RVMClassLoader.getApplicationClassLoader();
+     setContextClassLoader(cl);
+@@ -202,5 +213,8 @@
+     // invoke "main" method with argument list
+     Reflection.invoke(mainMethod, null, null, new Object[]{mainArgs}, true);
+     if (dbg) VM.sysWriteln("  MainThread.run(): \"main\" method completed.]");
++    if(RVMThread.autogenWSThread && WS.stats) {
++    	WS.dumpWSStatistics();
++    }
+   }
+ }
+diff -r 189a5647ca94 rvm/src/org/jikesrvm/scheduler/RVMThread.java
+--- a/rvm/src/org/jikesrvm/scheduler/RVMThread.java	Fri Apr 24 08:29:05 2015 +0200
++++ b/rvm/src/org/jikesrvm/scheduler/RVMThread.java	Mon Aug 31 23:58:51 2015 -0500
+@@ -20,6 +20,9 @@
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ 
++import java.util.Random;
++import org.jikesrvm.ArchitectureSpecific.ArchConstants;
++
+ import org.jikesrvm.ArchitectureSpecific.CodeArray;
+ import org.jikesrvm.ArchitectureSpecific.Registers;
+ import org.jikesrvm.ArchitectureSpecificOpt.PostThreadSwitch;
+@@ -30,8 +33,16 @@
+ import static org.jikesrvm.ArchitectureSpecific.StackframeLayoutConstants.STACK_SIZE_GUARD;
+ import static org.jikesrvm.ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_METHOD_ID_OFFSET;
+ import static org.jikesrvm.ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_RETURN_ADDRESS_OFFSET;
+-
+ import org.jikesrvm.ArchitectureSpecific.BaselineConstants;
++
++/* was in other
++import static org.jikesrvm.ia32.StackframeLayoutConstants.INVISIBLE_METHOD_ID;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACKFRAME_METHOD_ID_OFFSET;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACKFRAME_RETURN_ADDRESS_OFFSET;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACK_SIZE_GUARD;
++*/
++
+ import org.jikesrvm.ArchitectureSpecific.ThreadLocalState;
+ import org.jikesrvm.ArchitectureSpecific.StackframeLayoutConstants;
+ import org.jikesrvm.ArchitectureSpecific;
+@@ -52,6 +63,14 @@
+ import org.jikesrvm.objectmodel.ObjectModel;
+ import org.jikesrvm.objectmodel.ThinLockConstants;
+ import org.jikesrvm.runtime.Entrypoints;
++import org.jikesrvm.runtime.ExceptionDeliverer;
++import org.vmmagic.unboxed.AddressArray;
++//import org.jikesrvm.Constants;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.INVISIBLE_METHOD_ID;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACKFRAME_RETURN_ADDRESS_OFFSET;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++import static org.jikesrvm.ia32.StackframeLayoutConstants.STACK_SIZE_GUARD;
++import org.jikesrvm.classloader.RVMType;
+ import org.jikesrvm.runtime.Magic;
+ import org.jikesrvm.runtime.Memory;
+ import org.jikesrvm.runtime.RuntimeEntrypoints;
+@@ -313,31 +332,6 @@
+     return state == NEW || state == TERMINATED;
+   }
+ 
+-  /** Registers used by return barrier trampoline */
+-  @Entrypoint
+-  private final Registers trampolineRegisters = new Registers();
+-
+-  /** Return address of stack frame hijacked by return barrier */
+-  @Entrypoint
+-  private Address hijackedReturnAddress;
+-
+-  /** Callee frame pointer for stack frame hijacked by return barrier */
+-  private Address hijackedReturnCalleeFp = Address.zero();
+-
+-  /** Caller frame pointer for stack frame hijacked by return barrier */
+-  private Address hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
+-
+-  /** @return the callee frame pointer for the stack frame hijacked by the return barrier */
+-  public Address getHijackedReturnCalleeFp() {
+-    return hijackedReturnCalleeFp;
+-  }
+-
+-  /** debugging flag for return barrier trampoline */
+-  public static final boolean DEBUG_STACK_TRAMPOLINE = false;
+-
+-  /** pointer to bridge code for return barrier trampoline */
+-  public static ArchitectureSpecific.CodeArray stackTrampolineBridgeInstructions;
+-
+   /**
+    * Thread state. Indicates if the thread is running, and if so, what mode of
+    * execution it is using (Java, VM native, or JNI)
+@@ -481,7 +475,7 @@
+    */
+   public static long timerTicks;
+ 
+-  private long yieldpointsTaken;
++  protected long yieldpointsTaken;
+ 
+   private long yieldpointsTakenFully;
+ 
+@@ -1132,6 +1126,68 @@
+    */
+   public boolean osr_done = false;
+ 
++  //per thread perf event support
++	private static boolean PER_THREAD_PERF_MONITORING = false;
++
++	protected int perfEventGroup = -1;
++	// for work-stealing threads
++	protected static final int PERF_EVENT_GROUP_WS = 3;
++	// for OSR_Organizer and Organizer threads
++	protected static final int PERF_EVENT_GROUP_ORGANIZERS = 2;
++	// for org.mmtk.plan.generational.immix.GenImmixCollector* threads
++	protected static final int PERF_EVENT_GROUP_GC = 1;
++	// for CompilationThread; TimerThread; FinalizerThread; 
++	protected static final int PERF_EVENT_GROUP_SYS = 0;
++
++	private static long[] perfEventTotals_ws;
++	private static long[] perfEventTotals_organizers;
++	private static long[] perfEventTotals_gc;
++	private static long[] perfEventTotals_sys;
++
++	public static boolean wsPerThreadPerf = false;
++	
++	/*
++	 * From Jikes 3.1.3 release, calling getBytes() on a string variable is
++	 * generating ArrayIndexOutOfBoundsException in Thread.java: getThreadLocals(): Line 1076
++	 * eg. perfEventNames[i].getBytes(). However, calling getBytes() with a string literal
++	 * is working fine, eg. "LLC_MISSES".getBytes()
++	 * 
++	 * As a temporary work-around on this bug, for adding a new perf event:
++	 * 1) add a corresponding entry inside RVMThread.perfEventNames and 
++	 * 2) also an entry inside switch-case block inside the method 
++	 * 	  RVMThread.getPerfEventByteArray(i).
++	 * 
++	 * If we have to measure the per thread perf event, we use the command line option 
++	 * -Xws:perfEvents=true. By default its always false.
++	 */
++	public static final String[] perfEventNames = {
++		// Add more Perf Events if necessary
++		"UNHALTED_CORE_CYCLES",
++		"LLC_MISSES",
++		"LLC_REFERENCES"
++		// Also add corresponding entry inside the method getPerfEventByteArray() below
++	};
++	
++	private final static byte[] getPerfEventByteArray(int id) {
++		switch(id) {
++		case 0:
++			return "UNHALTED_CORE_CYCLES".concat("\0").getBytes();
++		case 1:
++			return "LLC_MISSES".concat("\0").getBytes();
++		case 2:
++			return "LLC_REFERENCES".concat("\0").getBytes();
++		default:
++			VM.sysFail("Error in fetching perfevent byte array");
++		}
++		return null;
++	}
++
++	private int[] perfEventFds;
++	private static long[][] perfEventperThread;
++	private static int perfEventThreadNum = 0;
++	private static String[] perfEventThreadName;
++	private long[] perfEventTemp = new long[3];
++
+   /**
+    * The number of processors to use.
+    */
+@@ -1141,7 +1197,7 @@
+    * Thread handle. Currently stores pthread_t, which we assume to be no larger
+    * than a pointer-sized word.
+    */
+-  public Word pthread_id;
++  public Word thread_id;
+ 
+   /**
+    * Thread priority handle.  Used when manipulating the threads priority.
+@@ -1362,6 +1418,11 @@
+     return result;
+   }
+ 
++  @Inline
++	public Monitor wsLock() {
++		return workStealingLockBySlot[threadSlot];
++	}
++
+   public Monitor communicationLock() {
+     return communicationLockForSlot(threadSlot);
+   }
+@@ -1448,6 +1509,202 @@
+     }
+   }
+ 
++  @Unpreemptible
++	private void perfEventAttach() {
++		if(PER_THREAD_PERF_MONITORING) {
++			int n = perfEventNames.length;
++			perfEventTemp[0] = 0;
++			perfEventTemp[1] = 0;
++			perfEventTemp[2] = 0;
++			perfEventFds = new int[n];
++			if (n > 0) perfEventFds[0] = -1;
++			for (int i = 0; i < n; i++) {
++				sysCall.sysPerfEventOpen_thread(i, thread_id, perfEventFds);
++			}
++		}
++	}
++
++	@Unpreemptible
++	public static void perfEventStart() {
++		if(PER_THREAD_PERF_MONITORING) {
++			hardHandshakeSuspend();
++			for(int i=0; i<numThreads;i++) {
++				threads[i].perfEventEnable();
++			}
++			hardHandshakeResume();
++		}
++	}
++
++	@Unpreemptible
++	private void perfEventEnable() {
++		int n = perfEventNames.length;
++		sysCall.sysPerfEventEnable_thread(perfEventFds,n);
++	}
++
++	@Unpreemptible
++	private void perfEventDisable() {
++		int n = perfEventNames.length;
++		sysCall.sysPerfEventDisable_thread(perfEventFds,n);
++	}
++
++	@UninterruptibleNoWarn
++	private void perfEventDetach() {
++		int n = perfEventNames.length;
++
++		// assign groups to system threads
++		final String threadName = this.getName();
++		if(threadName.contains("Organizer") || threadName.contains("ControllerThread") || threadName.contains("CompilationThread") ) {
++			perfEventGroup = PERF_EVENT_GROUP_ORGANIZERS;
++		}
++		else if(threadName.contains("TimerThread") || threadName.contains("FinalizerThread")) { 
++			perfEventGroup = PERF_EVENT_GROUP_SYS;
++		}
++		else if(this.isCollectorThread()) {
++			perfEventGroup = PERF_EVENT_GROUP_GC;
++		}
++		if(perfEventGroup == -1) {
++			VM.sysWrite("ERROR (PerThreadPerfMon): Thread Group Not Assigned For Thread-");
++			VM.sysWriteln(threadName);
++			VM.sysFail("PerThreadGroup");
++		}
++
++		acctLock.lockNoHandshake();
++		for (int i = 0; i < n; i++) {
++			long val = perfEventRead(i);	
++			perfEventperThread[i][perfEventThreadNum] = val;
++			switch(perfEventGroup) {
++			case PERF_EVENT_GROUP_WS:
++				perfEventTotals_ws[i] += val;
++				break;
++			case PERF_EVENT_GROUP_ORGANIZERS:
++				perfEventTotals_organizers[i] += val;
++				break;
++			case PERF_EVENT_GROUP_GC:
++				perfEventTotals_gc[i] += val;
++				break;
++			case PERF_EVENT_GROUP_SYS:
++				perfEventTotals_sys[i] += val;
++				break;
++			}
++		}
++		String name = getName().replace(" ", "");
++		name += ".T" + perfEventThreadNum;
++		perfEventThreadName[perfEventThreadNum] = name;
++		++perfEventThreadNum;
++		acctLock.unlock();
++	}
++
++	public long perfEventRead(int eventIndex) {
++		if(VM.VerifyAssertions) VM._assert(eventIndex >= 0 && eventIndex <= perfEventNames.length, "Invalid perfEventId");
++		sysCall.sysPerfEventRead_thread(eventIndex, perfEventFds, perfEventTemp);
++		if (perfEventTemp[1] != perfEventTemp[2]) {
++			// This thread has never run
++			if(this.systemThread == null) VM.sysFail("Counters overflowed");
++			return 0;
++		}
++		return perfEventTemp[0]; 
++	}
++
++	@Unpreemptible
++	public static void perfEventStop() {
++		if(PER_THREAD_PERF_MONITORING) {
++			hardHandshakeSuspend();
++			for(int i=0; i<numThreads;i++) {
++				threads[i].perfEventDetach();
++			}
++
++			int n = perfEventNames.length;
++			// Thread grouping
++			VM.sysWriteln("============================ Tabulate Statistics ============================");
++			// write names
++			VM.sysWrite("counters");
++			for (int i = 0; i < n; i++) {
++				for (int j = 0; j <= 3; j++){
++					String group = "";
++					switch(j) {
++					case PERF_EVENT_GROUP_WS:
++						group = "WSThreads";
++						break;
++					case PERF_EVENT_GROUP_ORGANIZERS:
++						group = "Organizers";
++						break;
++					case PERF_EVENT_GROUP_GC:
++						group = "GC";
++						break;
++					case PERF_EVENT_GROUP_SYS:
++						group = "System";
++						break;
++					}
++					VM.sysWrite(" ", perfEventNames[i], ".", group);
++				}
++			}
++			VM.sysWriteln();
++
++			// write values
++			VM.sysWrite(n);
++			for (int i = 0; i < n; i++) {
++				for (int j = 0; j <= 3; j++){
++					switch(j) {
++					case PERF_EVENT_GROUP_WS:
++						VM.sysWrite("   ", perfEventTotals_ws[i]);
++						break;
++					case PERF_EVENT_GROUP_ORGANIZERS:
++						VM.sysWrite("   ", perfEventTotals_organizers[i]);
++						break;
++					case PERF_EVENT_GROUP_GC:
++						VM.sysWrite("   ", perfEventTotals_gc[i]);
++						break;
++					case PERF_EVENT_GROUP_SYS:
++						VM.sysWrite("   ", perfEventTotals_sys[i]);
++						break;
++					}
++				}
++			}
++			VM.sysWriteln();
++			// till here
++
++			hardHandshakeResume();
++		}
++	}
++
++	@Unpreemptible
++	public static void perfEventStopAndPrintAll() {
++		if(PER_THREAD_PERF_MONITORING) {
++			hardHandshakeSuspend();
++			for(int i=0; i<numThreads;i++) {
++				threads[i].perfEventDetach();
++			}
++
++			int n = perfEventNames.length;
++			VM.sysWriteln("============================ Tabulate Statistics ============================");
++			VM.sysWrite("counters");
++
++			for (int i = 0; i < n; i++) {
++				for (int j = 0; j < perfEventThreadNum; j++){
++					VM.sysWrite(" ", perfEventNames[i], ".", perfEventThreadName[j]);
++				}
++				//total
++				VM.sysWrite("   ", perfEventNames[i], ".WSThreadsTotal");
++			}
++
++			VM.sysWriteln();
++			VM.sysWrite(n);
++
++			for (int i = 0; i < n; i++) {
++				for (int j = 0; j < perfEventThreadNum; j++){
++					VM.sysWrite(" ", perfEventperThread[i][j]);
++				}
++			}
++
++			for (int i = 0; i < n; i++) {
++				VM.sysWrite("   ", perfEventTotals_ws[i]);
++			}
++			VM.sysWriteln();
++
++			hardHandshakeResume();
++		}
++	}
++
+   /**
+    * Boot the threading subsystem.
+    */
+@@ -1464,9 +1721,32 @@
+     doProfileReport = new Latch(false);
+     monitorBySlot[getCurrentThread().threadSlot] = new NoYieldpointsMonitor();
+     communicationLockBySlot[getCurrentThread().threadSlot] = new Monitor();
++    workStealingLockBySlot[getCurrentThread().threadSlot] = new Monitor();
++		if(ws_pinning_system) {
++			for(int i=0; i<pin_map_system.length; i++) {
++				sysCall.wsIniatilizeSysThreadBindMask(pin_map_system[i]);
++			}
++		}
+     sysCall.sysCreateThreadSpecificDataKeys();
+     sysCall.sysStashVMThread(getCurrentThread());
+ 
++    // Initialize perf event
++		if (wsPerThreadPerf) {
++			PER_THREAD_PERF_MONITORING = true;
++			int n = perfEventNames.length;
++			sysCall.sysPerfEventInit_thread(n);
++			perfEventperThread = new long[n][MAX_THREADS];
++			perfEventTotals_ws = new long[n];
++			perfEventTotals_organizers = new long[n];
++			perfEventTotals_gc = new long[n];
++			perfEventTotals_sys = new long[n];
++			perfEventThreadName = new String[MAX_THREADS];
++			for (int i = 0; i < n; i++) {
++				sysCall.sysPerfEventCreate_thread(i, getPerfEventByteArray(i));
++			}
++			getCurrentThread().perfEventAttach();
++		}
++
+     if (traceAcct) {
+       VM.sysWriteln("boot thread at ",Magic.objectAsAddress(getCurrentThread()));
+     }
+@@ -1586,8 +1866,10 @@
+       }
+       if (communicationLockBySlot[threadSlot] == null) {
+         Monitor m = new Monitor();
++        Monitor m2 = new Monitor();
+         handshakeLock.lockWithHandshake();
+         communicationLockBySlot[threadSlot] = m;
++        workStealingLockBySlot[threadSlot] = m2;
+         handshakeLock.unlock();
+       }
+       Magic.sync(); /*
+@@ -2044,6 +2326,24 @@
+     checkBlockNoSaveContext();
+   }
+ 
++  @NoInline
++	@NoOptCompile
++	@BaselineSaveLSRegisters
++	@Unpreemptible("May block if asked to do so, but otherwise does not actions that would block")
++	void wsWrapperCheckBlock() {
++		wsCheckBlock();
++	}
++
++	@NoInline
++	@NoOptCompile
++	@BaselineNoRegisters
++	@Unpreemptible("May block if asked to do so, but otherwise does not actions that would block")
++	void wsCheckBlock() {
++		wsSafeToInstallRBarrier = true;
++		saveThreadState();
++		checkBlockNoSaveContext();
++	}
++
+   /**
+    * Internal method for transitioning a thread from IN_JAVA or IN_JAVA_TO_BLOCK to
+    * either BLOCKED_IN_NATIVE or BLOCKED_IN_JNI, depending on the value of the jni
+@@ -2220,6 +2520,101 @@
+     if (getCurrentThread() == this) {
+       if (traceBlock)
+         VM.sysWriteln("Thread #", threadSlot, " is blocking.");
++      wsWrapperCheckBlock();
++			wsSafeToInstallRBarrier = false;
++			result = getExecStatus();
++		} else {
++			if (traceBlock)
++				VM.sysWriteln("Thread #", threadSlot, " is being told to block.");
++			if (isAboutToTerminate) {
++				if (traceBlock)
++					VM.sysWriteln("Thread #", threadSlot,
++							" is terminating, returning as if blocked in TERMINATED state.");
++				result = TERMINATED;
++			} else {
++				takeYieldpoint = 1;
++				// CAS the execStatus field
++				int newState = setBlockedExecStatus();
++				result = newState;
++				if (traceReallyBlock)
++					VM.sysWriteln("Thread #", getCurrentThreadSlot(),
++							" is blocking thread #", threadSlot, " which is in state ",
++							newState);
++				// this broadcast serves two purposes: notifies threads that are
++				// IN_JAVA but waiting on monitor() that they should awake and
++				// acknowledge the block request; or notifies anyone
++				// waiting for this thread to block that the thread is
++				// BLOCKED_IN_NATIVE or BLOCKED_IN_JNI. in the latter case the
++				// broadcast() happens _before_ the setting of the flags that the
++				// other threads would be awaiting, but that is fine, since we're
++				// still holding the lock anyway.
++				monitor().broadcast();
++				if (newState == IN_JAVA_TO_BLOCK) {
++					if (!asynchronous) {
++						if (traceBlock)
++							VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++									" is waiting for thread #", threadSlot, " to block.");
++						while (ba.hasBlockRequest(this, token) && !ba.isBlocked(this) && !isAboutToTerminate) {
++							if (traceBlock)
++								VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++										" is calling wait until thread #", threadSlot, " blocks.");
++							// will this deadlock when the thread dies?
++							if (VM.VerifyAssertions) {
++								// do a timed wait, and assert that the thread did not disappear
++								// into native in the meantime
++								monitor().timedWaitRelativeNoHandshake(1000L * 1000L * 1000L); // 1 sec
++								if (traceReallyBlock) {
++									VM.sysWriteln("Thread #", threadSlot, "'s status is ",
++											getExecStatus());
++								}
++								assertUnacceptableStates(IN_NATIVE);
++							} else {
++								monitor().waitNoHandshake();
++							}
++							if (traceBlock)
++								VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++										" has returned from the wait call.");
++						}
++						if (isAboutToTerminate) {
++							result = TERMINATED;
++						} else {
++							result=getExecStatus();
++						}
++					}
++				} else if (newState == BLOCKED_IN_NATIVE || newState == BLOCKED_IN_JNI) {
++					// we own the thread for now - it cannot go back to executing Java
++					// code until we release the lock. before we do so we change its
++					// state accordingly and tell anyone who is waiting.
++					if (traceBlock)
++						VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++								" has seen thread #", threadSlot,
++								" in native; changing its status accordingly.");
++					ba.clearBlockRequest(this);
++					ba.setBlocked(this, true);
++				}
++			}
++		}
++		monitor().unlock();
++		if (traceReallyBlock)
++			VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++					" is done telling thread #", threadSlot, " to block.");
++		return result;
++	}
++
++	private boolean wsSafeToInstallRBarrier = false;
++	
++	@Unpreemptible("Only blocks if the receiver is the current thread, or if asynchronous is set to false and the thread is not already blocked")
++	private boolean wsBlock(BlockAdapter ba, boolean asynchronous) {
++		int result;
++		boolean safeWait = false;
++		if (traceBlock)
++			VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
++					" is requesting that thread #", threadSlot, " blocks.");
++		monitor().lockNoHandshake();
++		int token = ba.requestBlock(this);
++		if (getCurrentThread() == this) {
++			if (traceBlock)
++				VM.sysWriteln("Thread #", threadSlot, " is blocking.");
+       checkBlock();
+       result = getExecStatus();
+     } else {
+@@ -2293,11 +2688,13 @@
+         }
+       }
+     }
++    safeWait = wsSafeToInstallRBarrier;
++    wsSafeToInstallRBarrier = false;
+     monitor().unlock();
+     if (traceReallyBlock)
+       VM.sysWriteln("Thread #", getCurrentThread().threadSlot,
+           " is done telling thread #", threadSlot, " to block.");
+-    return result;
++    return safeWait;
+   }
+ 
+   public boolean blockedFor(BlockAdapter ba) {
+@@ -2319,6 +2716,11 @@
+     return block(ba, false);
+   }
+ 
++  	@Unpreemptible("May block if the receiver is the current thread or if the receiver is not yet blocked; otherwise does not perform actions that lead to blocking")
++	private boolean wsBlock(BlockAdapter ba) {
++		return wsBlock(ba, false);
++	}
++
+   @Unpreemptible
+   public void beginPairWith(RVMThread other) {
+     if (traceBlock) VM.sysWriteln("attempting to pair ",threadSlot," with ",other.threadSlot);
+@@ -2372,6 +2774,12 @@
+     block(handshakeBlockAdapter);
+   }
+ 
++  @Unpreemptible
++	public boolean wsBeginPairHandshake() {
++		beginPairWithCurrent();
++		return wsBlock(handshakeBlockAdapter);
++	}
++
+   @Uninterruptible
+   public void endPairHandshake() {
+     unblock(handshakeBlockAdapter);
+@@ -2747,6 +3155,80 @@
+     }
+   }
+ 
++  	/*
++	 * Methods for pinning threads to cores
++	 */
++	
++	protected static int pin_core_index = 0;
++	@Interruptible
++	private synchronized static int getNextCoreID() {
++		int id = pin_core_index++;
++		if(id == sysCall.sysNumProcessors()) {
++			id = pin_core_index = 0;
++		}
++		return id;
++	}
++	
++	/*
++	 * This method only support when -Xws:pinSocketCPU is provided
++	 * and also hyperthreading is ON
++	 * 
++	 * A typical layout, which this supports is:
++	 * 	
++	  	$ numactl --hardware
++		available: 2 nodes (0-1)
++		node 0 cpus: 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30
++		node 0 size: 24530 MB
++		node 0 free: 208 MB
++		node 1 cpus: 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31
++		node 1 size: 24576 MB
++		node 1 free: 85 MB
++		node distances:
++		node   0   1 
++  		0:  10  20 
++ 		1:  20  10 
++	 */
++	private static int[] multiSocket_physical_cores_inhyperthreading = new int[0];
++	@Interruptible
++	private synchronized static int getNextCoreID_socketAndCPUHint() {
++		/*
++		 *  The implementation of this method assumes the hyperthreading is ON.
++		 *  In case hyperthreading is OFF, use the -Xws:pinMap option 
++		 *  to hint the pin core ids.
++		 *  This function will fail in that case !!
++		 */
++		if(multiSocket_physical_cores_inhyperthreading.length == 0) {
++			final int physical_cores = cpusPerSocket * sockets;
++			multiSocket_physical_cores_inhyperthreading = new int[physical_cores];
++			// assuming even number of total processors
++			int curr_cpu = 0;
++			int curr_socket = 0;
++			for(int i=0; i<physical_cores; i++) {
++				if(i == cpusPerSocket*(curr_socket+1)) curr_cpu = ++curr_socket;
++				multiSocket_physical_cores_inhyperthreading[i] = curr_cpu;
++				curr_cpu += 2;
++			}
++		}
++		
++		int id = pin_core_index++;
++		if(id == multiSocket_physical_cores_inhyperthreading.length) {
++			id = pin_core_index = 0;
++		}
++		return multiSocket_physical_cores_inhyperthreading[id];
++	}
++	
++	/*
++	 *  This is used only when a exact pinMap is provided at runtime
++	 */
++	@Interruptible
++	private synchronized static int getNextCoreID_fromPinMap() {
++		int id = pin_core_index++;
++		if(id == pin_map_workers.length) {
++			id = pin_core_index = 0;
++		}
++		return pin_map_workers[id];
++	}
++
+   /**
+    * Begin execution of current thread by calling its "run" method. This method
+    * is at the bottom of all created method's stacks.
+@@ -2761,23 +3243,25 @@
+ 
+     RVMThread currentThread = getCurrentThread();
+ 
++    currentThread.perfEventAttach();
++
+     /*
+      * get pthread_id from the operating system and store into RVMThread field
+      */
+-    currentThread.pthread_id = sysCall.sysGetThreadId();
++    currentThread.thread_id = sysCall.sysGetThreadId();
+     currentThread.priority_handle = sysCall.sysGetThreadPriorityHandle();
+ 
+     /*
+      * set thread priority to match stored value
+      */
+-    sysCall.sysSetThreadPriority(currentThread.pthread_id,
++    sysCall.sysSetThreadPriority(currentThread.thread_id,
+         currentThread.priority_handle, currentThread.priority - Thread.NORM_PRIORITY);
+ 
+     currentThread.enableYieldpoints();
+     sysCall.sysStashVMThread(currentThread);
+     if (traceAcct) {
+       VM.sysWriteln("Thread #", currentThread.threadSlot, " with pthread id ",
+-          currentThread.pthread_id, " running!");
++          currentThread.thread_id, " running!");
+     }
+ 
+     if (trace) {
+@@ -2786,9 +3270,39 @@
+ 
+     try {
+       if (currentThread.systemThread != null) {
++        if(currentThread.isCollectorThread() && ws_pinning_gc) {
++					if(currentThread.getName().contains("org.mmtk.plan.generational")) {
++						final int index = currentThread.getCollectorContext().getId();
++						sysCall.wsThreadBindMaskSet(pin_map_gc[index]);
++					}
++				}
++				else if(ws_pinning_system) {
++					sysCall.sysThreadBindMaskSet();
++				}
++				if(WS.pinLog) {
++					VM.sysWriteln("[PIN_INFO] RVM-", currentThread.getName() ," has affinity for cpuid-",sysCall.sysGetCPU());
++				}
+         currentThread.systemThread.run();
+       } else {
++        // this is an application thread
++				if(ws_pinning_workers) {
++					// pin to the core
++					int core = 0;
++					if(RVMThread.pin_map_workers.length > 1) {
++						core = getNextCoreID_fromPinMap();
++					}
++					else if(sockets != -1 && cpusPerSocket != -1) {
++						core = getNextCoreID_socketAndCPUHint();
++					}
++					else {
++						core = getNextCoreID();
++					}
++					sysCall.wsThreadBindMaskSet(core);
++				}
++				if(WS.pinLog) VM.sysWriteln("[PIN_INFO] ", currentThread.getName() ," has affinity for cpuid-",sysCall.sysGetCPU());
++
+         currentThread.run();
++        if(autogenWSThread) WS.terminate();
+       }
+     } finally {
+       if (trace) {
+@@ -3056,165 +3570,6 @@
+   }
+ 
+   /**
+-   * The return barrier.
+-   * <p>
+-   * The following code implements return barriers as described
+-   * for Lisp by Yuasa
+-   *
+-   * http://www.yuasa.kuis.kyoto-u.ac.jp/~yuasa/ilc2002/index.html
+-   * http://dx.doi.org/10.1109/ISORC.2005.45
+-   *
+-   * and for Jikes RVM by Kumar et al
+-   *
+-   * http://dx.doi.org/10.1145/2398857.2384639
+-   * <p>
+-   * This code is executed when a method returns into a frame that
+-   * has been hijacked by the return barrier mechanism.   The return
+-   * barrier trampoline will save state, execute this method, and
+-   * then upon return from this method will transparently return into
+-   * the frame that had been hijacked.
+-   * <p>
+-   * In this default implementation, the barrier reinstalls itself
+-   * in the caller's frame thus incrementally moving the barrier down
+-   * the stack.
+-   * <p>
+-   * The execution of this method is fragile.  It is generally safest
+-   * to call some other method from here that does the substantive work
+-   * of the barrier.
+-   */
+-  @Entrypoint
+-  @Uninterruptible
+-  @Unpreemptible
+-  public static void returnBarrier() {
+-    /* reinstall the barrier in the caller's frame */
+-    if (DEBUG_STACK_TRAMPOLINE) {
+-      VM.sysWriteln(getCurrentThread().getId(), " T0: ", getCurrentThread().trampolineRegisters.gprs.get(BaselineConstants.T0_int).toAddress());
+-      VM.sysWriteln(getCurrentThread().getId(), " T1: ", getCurrentThread().trampolineRegisters.gprs.get(BaselineConstants.T1_int).toAddress());
+-      VM.sysWriteln(getCurrentThread().getId(), " nf: ", getCurrentThread().hijackedReturnCallerFp);
+-      VM.sysWriteln(getCurrentThread().getId(), " lf: ", getCurrentThread().hijackedReturnCalleeFp);
+-      VM.sysWriteln(getCurrentThread().getId(), " fp: ", Magic.getFramePointer());
+-      VM.sysWriteln(getCurrentThread().getId(), " np: ", Magic.getCallerFramePointer(Magic.getFramePointer()));
+-    }
+-    /* reinstall the barrier in the specified frame */
+-    getCurrentThread().installStackTrampolineBridge(getCurrentThread().hijackedReturnCallerFp);
+-  }
+-
+-  /**
+-   * Install the stack trampoline bridge at a given frame, hijacking
+-   * that frame, saving the hijacked return address and callee fp
+-   * in thread-local state to allow execution of the hijacked frame
+-   * later.
+-   *
+-   * @param targetFp The frame to be hijacked.
+-   */
+-  @Uninterruptible
+-  public void installStackTrampolineBridge(Address targetFp) {
+-    Address trampoline = getStackTrampolineBridgeIP();
+-    if (trampoline.isZero()) {
+-      if (VM.VerifyAssertions)
+-        VM._assert(VM.NOT_REACHED);
+-      else
+-        VM.sysWriteln("Warning: attempt to install stack trampoline without bridge instructions - nothing done.  See RVMThread.");
+-    } else if (trampoline.NE(Magic.getReturnAddressUnchecked(targetFp))) {
+-      /* install the trampoline at fp or the next suitable frame after fp */
+-      while (true) {
+-        if (Magic.getCallerFramePointer(targetFp).EQ(ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP)) {
+-          /* if we're at the bottom of the stack, then do not install anything */
+-          hijackedReturnAddress = Address.zero();
+-          hijackedReturnCalleeFp = Address.zero();
+-          return;
+-        }
+-        int cmid = Magic.getCompiledMethodID(targetFp);
+-        if (cmid == ArchitectureSpecific.ArchConstants.INVISIBLE_METHOD_ID) {
+-          /* skip invisible methods */
+-          targetFp = Magic.getCallerFramePointer(targetFp);
+-        } else {
+-          CompiledMethod calleeCM = CompiledMethods.getCompiledMethod(cmid);
+-          if (calleeCM.getCompilerType() == CompiledMethod.TRAP ||
+-              calleeCM.getMethod().getDeclaringClass().hasBridgeFromNativeAnnotation()) {
+-            /* skip traps and native bridges */
+-            targetFp = Magic.getCallerFramePointer(targetFp);
+-          } else
+-            break;
+-        }
+-      }
+-      hijackedReturnAddress = Magic.getReturnAddressUnchecked(targetFp);
+-      hijackedReturnCalleeFp = targetFp;
+-      hijackedReturnCallerFp = Magic.getCallerFramePointer(targetFp);
+-      if (VM.VerifyAssertions) VM._assert(trampoline.NE(hijackedReturnAddress));
+-      if (DEBUG_STACK_TRAMPOLINE) dumpFrame(targetFp);
+-      Magic.setReturnAddress(targetFp, trampoline);
+-      if (DEBUG_STACK_TRAMPOLINE) {
+-        dumpFrame(targetFp);
+-        VM.sysWriteln(getId(), " Installing trampoline at: ", targetFp);
+-        VM.sysWriteln(getId(), " Trampoline: ", trampoline);
+-        VM.sysWriteln(getId(), " Hijacked return address: ", hijackedReturnAddress);
+-        VM.sysWriteln(getId(), " Callee fp: ", hijackedReturnCalleeFp);
+-        VM.sysWriteln(getId(), " Caller fp: ", hijackedReturnCallerFp);
+-        dumpStack(hijackedReturnCalleeFp);
+-      }
+-    }
+-  }
+-
+-  /**
+-   * de-install the stack trampoline (disabling return barriers).
+-   */
+-  @Uninterruptible
+-  public void deInstallStackTrampoline() {
+-    if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln("deinstalling trampoline: ", framePointer);
+-    if (!hijackedReturnCalleeFp.isZero()) {
+-      if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln("need to reinstall: ", hijackedReturnAddress);
+-      hijackedReturnCalleeFp.plus(STACKFRAME_RETURN_ADDRESS_OFFSET).store(hijackedReturnAddress);
+-      hijackedReturnCalleeFp = Address.zero();
+-      hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
+-    }
+-  }
+-
+-  /** @return the address of the stack trampoline bridge code */
+-  @Inline
+-  private Address getStackTrampolineBridgeIP() {
+-    return Magic.objectAsAddress(stackTrampolineBridgeInstructions);
+-  }
+-
+-  /** @return the hijacked return address */
+-  @Inline
+-  public Address getTrampolineHijackedReturnAddress() {
+-    return hijackedReturnAddress;
+-  }
+-
+-  /**
+-   * Determine whether a given method is the stack trampoline
+-   *
+-   * @param ip the code to be checked
+-   * @return <code>true</code> if the code is the stack trampoline.
+-   */
+-  @Inline
+-  public static boolean isTrampolineIP(Address ip) {
+-    return getCurrentThread().getStackTrampolineBridgeIP().EQ(ip);
+-  }
+-
+-  /**
+-   * Given a frame that has been hijacked by the stack trampoline,
+-   * return the real (hijacked) return address.
+-   *
+-   * @param hijackedFp a frame that has been hijacked by the stack trampoline
+-   * @return the return address for the frame that was hijacked.
+-   */
+-  @Uninterruptible
+-  public static Address getHijackedReturnAddress(Address hijackedFp) {
+-    if (VM.VerifyAssertions) VM._assert(isTrampolineIP(Magic.getReturnAddressUnchecked(hijackedFp)));
+-    RVMThread t = getCurrentThread();
+-      if (!t.hijackedReturnCalleeFp.EQ(hijackedFp)) {
+-        for (int tid = 0; tid < nextSlot; tid++) {
+-          t = threadBySlot[tid];
+-          if (t != null && t.hijackedReturnCalleeFp.EQ(hijackedFp))
+-            break;
+-        }
+-      }
+-      return t.hijackedReturnAddress;
+-  }
+-
+-  /**
+    * Dump the specified frame in a format useful for debugging the stack
+    * trampoline
+    *
+@@ -3271,7 +3626,7 @@
+   @UnpreemptibleNoWarn("Exceptions may possibly cause yields")
+   public void suspend() {
+     if (false) VM.sysWriteln("Thread #",getCurrentThreadSlot()," suspending Thread #",getThreadSlot());
+-    ObjectModel.genericUnlock(thread);
++    ObjectModel.genericUnlock_internal(thread);
+     Throwable rethrow = null;
+     try {
+       observeExecStatus();
+@@ -3285,7 +3640,7 @@
+     } catch (Throwable t) {
+       rethrow = t;
+     }
+-    ObjectModel.genericLock(thread);
++    ObjectModel.genericLock_internal(thread);
+     if (rethrow != null)
+       RuntimeEntrypoints.athrow(rethrow);
+   }
+@@ -3439,7 +3794,7 @@
+         // queue.
+       }
+       // reacquire the lock, restoring the recursion count
+-      ObjectModel.genericLock(o);
++      ObjectModel.genericLock_internal(o);
+       waitObject = null;
+       if (waitCount != 1) { // reset recursion count
+         Lock l2 = ObjectModel.getHeavyLock(o, true);
+@@ -3606,7 +3961,7 @@
+     // massive retardation. someone might be holding the java.lang.Thread lock.
+     boolean holdsLock = holdsLock(thread);
+     if (holdsLock)
+-      ObjectModel.genericUnlock(thread);
++      ObjectModel.genericUnlock_internal(thread);
+     boolean hasTimeout;
+     long whenWakeupNanos;
+     hasTimeout = (time != 0);
+@@ -3635,7 +3990,7 @@
+     monitor().unlock();
+ 
+     if (holdsLock)
+-      ObjectModel.genericLock(thread);
++      ObjectModel.genericLock_internal(thread);
+ 
+     if (throwThis != null) {
+       throw throwThis;
+@@ -4199,7 +4554,7 @@
+       // do two things: check if we should be blocking, and act upon
+       // handshake requests. This also has the effect of reasserting that
+       // we are in fact IN_JAVA (as opposed to IN_JAVA_TO_BLOCK).
+-      t.checkBlock();
++      t.wsWrapperCheckBlock();
+ 
+       // Process timer interrupt event
+       if (t.timeSliceExpired != 0) {
+@@ -4736,7 +5091,7 @@
+   public int getPriority() {
+     if (isAlive()) {
+       // compute current priority
+-      priority = sysCall.sysGetThreadPriority(pthread_id, priority_handle) + Thread.NORM_PRIORITY;
++      priority = sysCall.sysGetThreadPriority(thread_id, priority_handle) + Thread.NORM_PRIORITY;
+     }
+     if (tracePriority) {
+       VM.sysWriteln("Thread #", getThreadSlot(), " get priority returning: ", priority);
+@@ -4752,7 +5107,7 @@
+    */
+   public void setPriority(int priority) {
+     if (isAlive()) {
+-      int result = sysCall.sysSetThreadPriority(pthread_id, priority_handle, priority - Thread.NORM_PRIORITY);
++      int result = sysCall.sysSetThreadPriority(thread_id, priority_handle, priority - Thread.NORM_PRIORITY);
+       if (result == 0) {
+         this.priority = priority;
+         if (tracePriority) {
+@@ -5442,7 +5797,7 @@
+     if (VM.VerifyAssertions) {
+       VM._assert(VM.runningVM);
+     }
+-    Address ip = Magic.getReturnAddress(fp);
++    Address ip = RVMThread.getReturnAddress_(fp);
+     fp = Magic.getCallerFramePointer(fp);
+     dumpStack(ip, fp);
+   }
+@@ -5482,7 +5837,7 @@
+           // skip to next frame
+           if (!MemoryManager.addressInVM(ip)) {
+             showMethod("native frame", fp);
+-            ip = Magic.getReturnAddress(fp);
++            ip = RVMThread.getReturnAddress_(fp);
+             fp = Magic.getCallerFramePointer(fp);
+           } else {
+ 
+@@ -5546,7 +5901,7 @@
+                 }
+               }
+             }
+-            ip = Magic.getReturnAddress(fp);
++            ip = RVMThread.getReturnAddress(fp);
+             fp = Magic.getCallerFramePointer(fp);
+           }
+           if (!isAddressValidFramePointer(fp)) {
+@@ -5596,7 +5951,7 @@
+       VM.sysWrite("[");
+       VM.sysWrite(fp);
+       VM.sysWrite(", ");
+-      VM.sysWrite(Magic.getReturnAddress(fp));
++      VM.sysWrite(RVMThread.getReturnAddress_(fp));
+       VM.sysWrite("] ");
+     }
+   }
+@@ -5806,4 +6161,1565 @@
+     sloppyExecStatusHistogram[oldState]++;
+     sloppyExecStatusHistogram[newState]++;
+   }
++
++
++  	/**
++	 * JikesRVM TRY-CATCH WORK-STEALING 
++	 */
++
++	/*
++	 * RDTSC timings for barrier
++	 */
++	protected long totalBarrierCPUCycles = 0;
++
++	/*
++	 * RDTSC timings for successful steals
++	 */
++	protected long totalSuccessStealCPUCycles = 0;
++
++	/*
++	 * RDTSC timings for failed steals
++	 */
++	protected long totalFailedStealCPUCycles = 0;
++
++	// Automatically launch the workstealing thread
++	// as soon as application's main method is executed
++	public static boolean autogenWSThread = true;
++	protected static boolean wsThreadsLaunched = false;
++
++	/*
++	 * Thread pinning support
++	 */
++	// {
++	protected boolean trace_cpuid = false; 
++	public static boolean ws_pinning_workers = false;
++	public static int sockets = -1;
++	public static int cpusPerSocket = -1;
++	public static int[] pin_map_workers = new int[0];
++	protected int ws_id = -1;
++	public static boolean ws_pinning_system = false;
++	public static int[] pin_map_system = new int[0];
++	public static boolean ws_pinning_gc = false;
++	public static int[] pin_map_gc = new int[0];
++	// }
++
++	private static final Monitor[] workStealingLockBySlot = new Monitor[MAX_THREADS];
++
++	public StackFrameCopier wsFrameCopier = new StackFrameCopier();
++	private byte[] wsShadowStack;
++	private WS.Continuation wsContinuation = new WS.Continuation(); 
++	public WS.Join wsJoin = new WS.Join();
++	public WS.FinishFirst wsFinishFirst = new WS.FinishFirst();
++	public WS.Finish wsFinish = new WS.Finish();
++	public int wsSpecialNVMap = 0;
++	public boolean wsFlag = false;
++	public volatile boolean wsInJoin = false;
++	Random wsRand;
++
++	public volatile WS.StealInfo wsStealHead = null;
++	public volatile WS.FinishInfo wsFinishHead = null;
++
++
++	public int totalSteals = 0;
++	public int findAttempts = 0;
++	public int pushes = 0;
++	protected int thiefInstalledBarriers = 0;
++	protected int preInstalledBarriers = 0;
++	// following 4 declarations & 2 methods valid only if createContinuationDistribution==true
++	protected int tasksEQ2 = 0;	// tasks <= 2
++	protected int tasksLE4 = 0;	// tasks <= 4
++	protected int tasksGT4 = 0;	// tasks <= 8
++	@Inline
++	private void continuationsDistribution(int tasks) {
++		if(tasks == 2) tasksEQ2++;
++		else if(tasks > 2 && tasks <= 4) tasksLE4++;
++		else if(tasks > 4) tasksGT4++;
++	}
++
++	protected boolean wsThread = false;
++	protected int wsSynchronizationLock = 0;
++
++	private boolean wsWaitingInsideBarrier = false;
++	private byte[] wsVictimShadowStack = null;
++	Address victimYieldFpOnNewStack = Address.zero();
++	Address victimYieldIPOnNewStack = Address.zero();
++	@Inline
++	public void wsSetInnermost() {
++		contextRegisters.setInnermost(victimYieldIPOnNewStack, victimYieldFpOnNewStack);
++	}
++	public final byte[] wsGetClonedStack() {
++		return wsVictimShadowStack;
++	}
++	private final static int ARRAY_OF_CONTINUATIONS_MAXSIZE = 25; 
++	private final static int ON_OVERFLOW_RESTART_INDEX_IN_ARRAY_OF_CONTINUATIONS = 20;
++	private final AddressArray array_of_continuations = AddressArray.create(ARRAY_OF_CONTINUATIONS_MAXSIZE);
++	private int fpsInContList = 0;
++	private int indexInContList = 0;
++	private boolean iInstalledABarrier = false;
++
++	public static boolean wsRetBarrier = false;
++
++	/** Registers used by return barrier trampoline */
++	private Registers trampolineRegisters = new Registers();
++
++	/** Return address of stack frame hijacked by return barrier */
++	private Address hijackedReturnAddress;
++
++	/** Callee frame pointer for stack frame hijacked by return barrier */
++	private Address hijackedReturnCalleeFp = Address.zero();
++
++	/** Caller frame pointer for stack frame hijacked by return barrier */
++	private Address hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++
++	/** @return the callee frame pointer for the stack frame hijacked by the return barrier */
++	public Address getHijackedReturnCalleeFp() { return hijackedReturnCalleeFp; }
++
++	/** debugging flag for return barrier trampoline */
++	public static final boolean DEBUG_STACK_TRAMPOLINE = false;
++
++	/** pointer to bridge code for return barrier trampoline */
++	public static ArchitectureSpecific.CodeArray stackTrampolineBridgeInstructions;
++
++	@Uninterruptible
++	@Inline
++	public static Address getReturnAddress_(Address fp) {
++		Address rtn = Magic.getReturnAddressUnchecked(fp);
++		if (isTrampolineIP(rtn)) {
++			RVMThread t = getCurrentThread();
++			if (!t.hijackedReturnCalleeFp.EQ(fp)) {
++				for (int tid = 0; tid < nextSlot; tid++) {
++					t = threadBySlot[tid];
++					if (t != null && t.hijackedReturnCalleeFp.EQ(fp))
++						break;
++				}
++			}
++			VM.sysWrite("<H>");
++			return t.hijackedReturnAddress;
++		} else {
++			return rtn;
++		}
++	}
++
++	@Uninterruptible
++	@Inline
++	public static Address getReturnAddress(Address fp) {
++		Address rtn = Magic.getReturnAddressUnchecked(fp);
++		if (isTrampolineIP(rtn)) {
++			RVMThread t = getCurrentThread();
++			if (!t.hijackedReturnCalleeFp.EQ(fp)) {
++				for (int tid = 0; tid < nextSlot; tid++) {
++					t = threadBySlot[tid];
++					if (t != null && t.hijackedReturnCalleeFp.EQ(fp))
++						break;
++				}
++			}
++			return t.hijackedReturnAddress;
++		} else {
++			return rtn;
++		}
++	}
++
++	/**
++	 * The return barrier.
++	 * <p>
++	 * The following code implements return barriers as described
++	 * for Lisp by Yuasa
++	 *
++	 * http://www.yuasa.kuis.kyoto-u.ac.jp/~yuasa/ilc2002/index.html
++	 * http://dx.doi.org/10.1109/ISORC.2005.45
++	 *
++	 * and for Jikes RVM by Kumar et al
++	 *
++	 * http://dx.doi.org/10.1145/2398857.2384639
++	 * <p>
++	 * This code is executed when a method returns into a frame that
++	 * has been hijacked by the return barrier mechanism.   The return
++	 * barrier trampoline will save state, execute this method, and
++	 * then upon return from this method will transparently return into
++	 * the frame that had been hijacked.
++	 * <p>
++	 * In this default implementation, the barrier reinstalls itself
++	 * in the caller's frame thus incrementally moving the barrier down
++	 * the stack.
++	 * <p>
++	 * The execution of this method is fragile.  It is generally safest
++	 * to call some other method from here that does the substantive work
++	 * of the barrier.
++	 */
++	@Entrypoint
++	@Uninterruptible
++	@Unpreemptible
++	public static void returnBarrier() {
++		/* reinstall the barrier in the caller's frame */
++		if (DEBUG_STACK_TRAMPOLINE) {
++			VM.sysWriteln(getCurrentThread().getId(), " T0: ", getCurrentThread().trampolineRegisters.gprs.get(BaselineConstants.T0_int).toAddress());
++			VM.sysWriteln(getCurrentThread().getId(), " T1: ", getCurrentThread().trampolineRegisters.gprs.get(BaselineConstants.T1_int).toAddress());
++			VM.sysWriteln(getCurrentThread().getId(), " nf: ", getCurrentThread().hijackedReturnCallerFp);
++			VM.sysWriteln(getCurrentThread().getId(), " lf: ", getCurrentThread().hijackedReturnCalleeFp);
++			VM.sysWriteln(getCurrentThread().getId(), " fp: ", Magic.getFramePointer());
++			VM.sysWriteln(getCurrentThread().getId(), " np: ", Magic.getCallerFramePointer(Magic.getFramePointer()));
++		}
++		/* reinstall the barrier in the specified frame */
++		getCurrentThread().returnBarrier_internal();
++	}
++
++	/**
++	 * Install the stack trampoline bridge at a given frame, hijacking
++	 * that frame, saving the hijacked return address and callee fp
++	 * in thread-local state to allow execution of the hijacked frame
++	 * later.
++	 *
++	 * @param targetFp The frame to be hijacked.
++	 */
++	@Uninterruptible
++	@Inline
++	public void wsInstallStackTrampolineBridge(Address targetFp) {
++		Address trampoline = getStackTrampolineBridgeIP();
++		if(wsDebugTrace) {
++			if (trampoline.isZero()) {
++				if (VM.VerifyAssertions)
++					VM._assert(VM.NOT_REACHED);
++				else
++					VM.sysWriteln("Warning: attempt to install stack trampoline without bridge instructions - nothing done.  See RVMThread.");
++			} else if (trampoline.NE(Magic.getReturnAddressUnchecked(targetFp))) {
++				/* install the trampoline at fp or the next suitable frame after fp */
++				while (true) {
++					if (Magic.getCallerFramePointer(targetFp).EQ(ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP)) {
++						/* if we're at the bottom of the stack, then do not install anything */
++						hijackedReturnAddress = Address.zero();
++						hijackedReturnCalleeFp = Address.zero();
++						return;
++					}
++					int cmid = Magic.getCompiledMethodID(targetFp);
++					if (cmid == ArchitectureSpecific.ArchConstants.INVISIBLE_METHOD_ID) {
++						/* skip invisible methods */
++						VM.sysWriteln("Warning: install stack trampoline skipping INVISIBLE_METHOD..  See RVMThread.");
++						targetFp = Magic.getCallerFramePointer(targetFp);
++					} else {
++						CompiledMethod calleeCM = CompiledMethods.getCompiledMethod(cmid);
++						if (calleeCM.getCompilerType() == CompiledMethod.TRAP ||
++								calleeCM.getMethod().getDeclaringClass().hasBridgeFromNativeAnnotation()) {
++							/* skip traps and native bridges */
++							VM.sysWriteln("Warning: install stack trampoline skipping Traps..  See RVMThread.");
++							targetFp = Magic.getCallerFramePointer(targetFp);
++						} else
++							break;
++					}
++				}
++				if (DEBUG_STACK_TRAMPOLINE) {
++					VM.sysWriteln(getId(), " Installing trampoline at: ", targetFp);
++					VM.sysWriteln(getId(), " Dumping my original stack first");
++					dumpStack(this.contextRegisters.getInnermostInstructionAddress(),this.contextRegisters.getInnermostFramePointer());
++				}
++				hijackedReturnAddress = Magic.getReturnAddressUnchecked(targetFp);
++				hijackedReturnCalleeFp = targetFp;
++				hijackedReturnCallerFp = Magic.getCallerFramePointer(targetFp);
++				if (VM.VerifyAssertions) VM._assert(trampoline.NE(hijackedReturnAddress));
++				Magic.setReturnAddress(targetFp, trampoline);
++				if (DEBUG_STACK_TRAMPOLINE) {
++					VM.sysWriteln(getId(), " Trampoline: ", trampoline);
++					VM.sysWriteln(getId(), " Hijacked return address: ", hijackedReturnAddress);
++					VM.sysWriteln(getId(), " Callee fp: ", hijackedReturnCalleeFp);
++					VM.sysWriteln(getId(), " Caller fp: ", hijackedReturnCallerFp);
++					VM.sysWriteln(getId(), " Trampoline installation done. Now Dumping the new stack");
++					//				dumpStack(hijackedReturnCalleeFp);
++					dumpStack(this.contextRegisters.getInnermostInstructionAddress(),this.contextRegisters.getInnermostFramePointer());
++				}
++			}
++		}
++		else {
++			// No checks on fast path
++			hijackedReturnAddress = Magic.getReturnAddressUnchecked(targetFp);
++			hijackedReturnCalleeFp = targetFp;
++			hijackedReturnCallerFp = Magic.getCallerFramePointer(targetFp);
++			Magic.setReturnAddress(targetFp, trampoline);
++		}
++	}
++
++	@Uninterruptible
++	@Inline
++	public void resetTramoplineInfo() {
++		if(wsDebugTrace) {
++			VM.sysWriteln(getId(),": Resetting my barrier variables");
++		}
++		wsReturnBarrierUninstalled = true;
++		hijackedReturnCalleeFp = Address.zero();
++		hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++	}
++
++	@Uninterruptible
++	@Inline
++	public void resetTramoplineInfo_unlocked() {
++		wsReturnBarrierUninstalled = true;
++		wsSafeToReturnFromBarrier = true;
++		wsWaitingInsideBarrier = false;
++		hijackedReturnCalleeFp = Address.zero();
++		hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++	}
++
++	/**
++	 * de-install the stack trampoline (disabling return barriers).
++	 */
++	@Uninterruptible
++	@Inline
++	public void deInstallStackTrampoline() {
++		if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln(getId(),": deinstalling trampoline: ", framePointer);
++		if (!hijackedReturnCalleeFp.isZero()) {
++			if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln(getId(),": need to reinstall: ", hijackedReturnAddress);
++			hijackedReturnCalleeFp.plus(STACKFRAME_RETURN_ADDRESS_OFFSET).store(hijackedReturnAddress);
++			hijackedReturnCalleeFp = Address.zero();
++			hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++			wsReturnBarrierUninstalled = true;
++			if(wsDebugTrace) {
++				VM.sysWriteln(getId(),": My barrier is deInstalled by thief W-",getCurrentThread().getId());
++			}
++		}
++	}
++
++	@Uninterruptible
++	@Inline
++	public void deInstallStackTrampoline_fromGC() {
++		if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln(getId(),": deinstalling trampoline: ", framePointer);
++		if (!hijackedReturnCalleeFp.isZero()) {
++			if (DEBUG_STACK_TRAMPOLINE) VM.sysWriteln(getId(),": need to reinstall: ", hijackedReturnAddress);
++			hijackedReturnCalleeFp.plus(STACKFRAME_RETURN_ADDRESS_OFFSET).store(hijackedReturnAddress);
++			hijackedReturnCalleeFp = Address.zero();
++			hijackedReturnCallerFp = ArchitectureSpecific.StackframeLayoutConstants.STACKFRAME_SENTINEL_FP;
++			wsReturnBarrierUninstalled = true;
++			if(workstealingInProgress) VM.sysFail("GC cannot take place when workstealingInProgress");
++			wsSafeToReturnFromBarrier = true;
++			wsWaitingInsideBarrier = false;
++			if(wsDebugTrace) {
++				VM.sysWriteln(getId(),": My barrier is deInstalled from GC");
++			}
++		}
++	}
++
++	@Uninterruptible
++	@Inline
++	private void wsUnlockFromReturnBarrier() {
++		wsLock().lockNoHandshake();
++		/* Never use this method here at all if the victim has already branched into the return barrier else there will be bugs !!
++		deInstallStackTrampoline();
++		 */
++
++		// List contains fps of callee to the continuation frames. Once the steal is completed, 
++		// means the last fp in the list is the callee to the task stolen in this steal.
++		fpsInContList--;	
++		wsSafeToReturnFromBarrier = true;
++		wsLock().broadcast();
++		wsLock().unlock();
++	}
++
++	// Some debug flags
++	// {
++	final protected static boolean createContinuationDistribution = false;
++	// Switches to enable / disble optimizations related to return barrier
++	// 1) The most basic optimization w.r.t return barrier
++	final private static boolean victimCanBeReleasedAfterRBarrierIsInstalled = true;
++	// 2) Enable this only if 1 is true
++	final private static boolean victimCanReinstallBarrier = true;
++	// 3) Enable this only if 1 and 2 is true
++	final private static boolean thiefCanInitiateStealFromAPreInstalledBarrier = true;
++	// }
++
++	@Uninterruptible
++	@Inline
++	public void returnBarrier_internal() {
++		if(wsDebugTrace) {
++			VM.sysWriteln(getId(),": Entering inside rbarrier");
++		}
++		{
++			wsLock().lockNoHandshake();
++			hijackedReturnAddress_original = hijackedReturnAddress;
++			while(true) {
++				boolean removeBarrier = false;
++				// 1. should break out if no steals in progress
++				//		1a) try to re-install the barrier 
++				if(wsSafeToReturnFromBarrier) {
++					if(victimCanReinstallBarrier) {
++						if(indexInContList < fpsInContList) {
++							if(false) {
++								final int remaining = fpsInContList - indexInContList;
++								if(remaining >= 4) { 
++									// install in the middle most fp - better than installing in each fp
++									final int sum = indexInContList + fpsInContList;
++									indexInContList = (sum%2 == 0) ? (sum/2 -1) : sum/2;
++								}
++							}
++							wsInstallStackTrampolineBridge(array_of_continuations.get(indexInContList++));	
++							if(wsDebugTrace) {
++								VM.sysWriteln(getId(),": Done reinstalling my own rbarrier");
++							}
++							break;
++						}
++						else {
++							// remove barrier variables as its now going to be unInstalled
++							removeBarrier = true;
++						}
++					}
++					else {
++						// remove barrier variables as its now going to be unInstalled
++						removeBarrier = true;
++					}
++				}
++				// If I am here then it means either: 
++				// a) I shd remove barrier 
++				// 			OR
++				// b) !wsSafeToReturnFromBarrier
++				if(removeBarrier) {
++					// Break out only if 
++					// i) no work-stealing is in progress
++					//				OR
++					// ii) The last thief decided that no further steal happens from this barrier
++					//    position. This is only if there are no more continuations remaining below
++					//    Only one variable workstealingInProgress is not sufficient to decide. 
++					//
++					//    Helps reducing failed steal ========> 
++					//	  If there is no continuations but before I reach here, another thief get
++					//    holds of me then it can do a failed steal attempt.
++					//
++					//	  Helps removing deadlock =========>
++					//	  When the last theif found there are no more continuations left, it marks
++					//    wsReturnBarrierUninstalled =  true. Now if we dont have the check for 
++					//    wsReturnBarrierUninstalled here then there maybe a deadlock. Suppose another
++					//    another theif grabs me mark workstealingInProgress=true. But just then I reach
++					//    over here and see that workstealingInProgress is in progress, I will keep waiting
++					//    However the thief is not aware of this, and it will wait for me to yield, which
++					//    will never happen. Hence two variables required here.
++					if(!workstealingInProgress || wsReturnBarrierUninstalled) {
++						if(wsDebugTrace) {
++							VM.sysWriteln(getId(),": No steal in progress hence removing my barrier");
++						}
++						resetTramoplineInfo();
++						break;
++					}
++					else {
++						if(wsDebugTrace) {
++							VM.sysWriteln(getId(),": There is a steal in progress hence cannot remove my barrier and so waiting");
++						}
++					}
++				}
++				else {
++					// case b
++					// ==> simply wait !!!
++					if(wsDebugTrace) {
++						VM.sysWriteln(getId(),": Thief still access my stack hence waiting in barrier to try unwind");
++					}
++				}
++				final long start = Magic.getTimeBase();
++				wsWaitingInsideBarrier = true;
++				wsLock().waitNoHandshake();
++				wsWaitingInsideBarrier = false;
++				totalBarrierCPUCycles += (Magic.getTimeBase() - start);
++				// 3. update the hijacked return address as thief may have updated it with join instruction
++				hijackedReturnAddress_original = hijackedReturnAddress;
++			}
++
++			wsLock().unlock();
++		}
++		if(wsDebugTrace) {
++			VM.sysWriteln(getId(),": Returning from rbarrier");
++		}
++	}
++
++	private Address hijackedReturnAddress_original; //is set only from returnBarrier() method
++	public Address getHijackedReturnCallerFp() { return hijackedReturnCallerFp; }
++	public Address getHijackedReturnAddress() { return hijackedReturnAddress; }
++
++	public boolean wsMaintainsClonedStackAlso() {
++		return !wsReturnBarrierUninstalled;
++	}
++
++	// Lock/Unlock flags for return barrier: a) and b)
++	/*
++	 * a)
++	 * --- This flag is turned on by thief at the victim as soon as it installs a barrier
++	 * on this victim
++	 * --- Thief can mark it off if it starts a steal from a barrier but finds 0 or 1
++	 * continuations.
++	 * --- Victim is allowed to mark it off only when its removing the barrier from its
++	 * stack
++	 * 
++	 * Thieves use this to decide if they can start stealing from a return barrier
++	 * without forcing the victim to execute yieldpoint. 
++	 */
++	private boolean wsReturnBarrierUninstalled = true;
++	/*
++	 * b) 
++	 * -- Default value is true. Only a thief can make it off (false)
++	 * Victims can only read but cannot write to it. Victims use it
++	 * to decide when it becomes safe for them to re-install this barrier
++	 * at a new position.
++	 */
++	private boolean wsSafeToReturnFromBarrier = true;
++
++	/*
++	 * This lock is used to decide if a steal is is progress at a victim.
++	 * However, this flag is also used inside return barrier to decide
++	 * if its safe for a victim to remove its return barrier from its stack.
++	 * Only a thief is allowed to write to this flag and make it true/false.
++	 * Victims can only read it. Unless its false, they cannot remove its
++	 * return barrier. 
++	 */
++	protected boolean workstealingInProgress = false;
++
++	public void setHijackedReturnAddress(Address ip) { hijackedReturnAddress = ip; } 
++
++	/** @return the address of the stack trampoline bridge code */
++	@Inline
++	private Address getStackTrampolineBridgeIP() { return Magic.objectAsAddress(stackTrampolineBridgeInstructions); }
++
++	/** @return the hijacked return address */
++	@Inline
++	public Address getTrampolineHijackedReturnAddress() { return hijackedReturnAddress; }
++
++	/**
++	 * Determine whether a given method is the stack trampoline
++	 *
++	 * @param ip the code to be checked
++	 * @return <code>true</code> if the code is the stack trampoline.
++	 */
++	@Inline
++	public static boolean isTrampolineIP(Address ip) { return getCurrentThread().getStackTrampolineBridgeIP().EQ(ip); }
++
++	/**
++	 * Given a frame that has been hijacked by the stack trampoline,
++	 * return the real (hijacked) return address.
++	 *
++	 * @param hijackedFp a frame that has been hijacked by the stack trampoline
++	 * @return the return address for the frame that was hijacked.
++	 */
++	@Uninterruptible
++	public static Address getHijackedReturnAddress(Address hijackedFp) {
++		if (VM.VerifyAssertions) VM._assert(isTrampolineIP(Magic.getReturnAddressUnchecked(hijackedFp)));
++		RVMThread t = getCurrentThread();
++		if (!t.hijackedReturnCalleeFp.EQ(hijackedFp)) {
++			for (int tid = 0; tid < nextSlot; tid++) {
++				t = threadBySlot[tid];
++				if (t != null && t.hijackedReturnCalleeFp.EQ(hijackedFp))
++					break;
++			}
++		}
++		return t.hijackedReturnAddress;
++	}
++
++	@Uninterruptible
++	@Inline
++	public Address getCalleeFramePointer(final Address fp) {
++		Address calleeFP = fp;
++		final Address top = Magic.objectAsAddress(this.getStack());
++		final Address base = top.plus(this.getStackLength());
++
++		while(calleeFP.NE(base)) {
++			if(calleeFP.loadAddress().EQ(fp)) return calleeFP;
++			calleeFP = calleeFP.minus(StackframeLayoutConstants.BYTES_IN_STACKSLOT);
++		}
++		return Address.zero();
++	}
++
++	@Unpreemptible
++	@Inline
++	protected void wsCheckShadowStack_retbarrier(RVMThread victim) {
++		if (wsShadowStack == null || wsShadowStack.length < victim.getStackLength()) {
++			wsShadowStack = MemoryManager.newStack(victim.getStackLength());
++		}
++
++		if (victim.wsVictimShadowStack == null || victim.wsVictimShadowStack.length < victim.getStackLength()) {
++			victim.wsVictimShadowStack = MemoryManager.newStack(victim.getStackLength());
++		}
++	}
++
++	@Unpreemptible
++	@Inline
++	public static Address wsCloneVictimStack(final RVMThread victim, final Address yieldpointFP) {
++		byte[] newStack = victim.wsVictimShadowStack;
++		byte[] currStack = victim.getStack();
++
++		Address currTop = Magic.objectAsAddress(currStack).plus(currStack.length);
++		Address newTop = Magic.objectAsAddress(newStack).plus(newStack.length);
++
++		Offset currDepth = currTop.diff(yieldpointFP);
++		Address newFP = newTop.minus(currDepth);
++
++		Memory.memcopy(newFP, yieldpointFP, currDepth.toWord().toExtent());
++
++		Offset delta = newFP.diff(yieldpointFP);
++
++		adjustStack(newStack, newFP, delta);
++		victim.victimYieldIPOnNewStack = Magic.getReturnAddress(yieldpointFP);
++
++		return Magic.getCallerFramePointer(newFP);
++	}
++
++	/**
++	 * This method should always be called from a method which has following annotations:
++	 * 1) @Unpreemptible
++	 * 2) @NoInline
++	 * 3) @NoOptCompile
++	 * 4) @BaselineSaveLSRegisters
++	 */
++	@Unpreemptible
++	@NoInline
++	@BaselineNoRegisters
++	private void wsCloneMyOwnStack(Address ip, Address fp) {
++		byte[] newStack = wsVictimShadowStack;
++		byte[] myStack = stack;
++
++		// initialize new stack with live portion of stack we're
++		// currently running on
++		//
++		// lo-mem hi-mem
++		// |<---myDepth----|
++		// +----------+---------------+
++		// | empty | live |
++		// +----------+---------------+
++		// ^myStack ^myFP ^myTop
++		//
++		// +-------------------+---------------+
++		// | empty | live |
++		// +-------------------+---------------+
++		// ^newStack ^newFP ^newTop
++		//
++		Address myTop = Magic.objectAsAddress(myStack).plus(myStack.length);
++		Address newTop = Magic.objectAsAddress(newStack).plus(newStack.length);
++
++		Address myFP = Magic.getFramePointer();
++		Offset myDepth = myTop.diff(myFP);
++		Address newFP = newTop.minus(myDepth);
++
++		// The frame pointer addresses the top of the frame on powerpc and
++		// the bottom
++		// on intel. if we copy the stack up to the current
++		// frame pointer in here, the
++		// copy will miss the header of the intel frame. Thus we make another
++		// call
++		// to force the copy. A more explicit way would be to up to the
++		// frame pointer
++		// and the header for intel.
++		Offset delta = copyStack(newStack);
++
++		// fix up registers and save areas so they refer
++		// to "newStack" rather than "myStack"
++		//
++		adjustStack(newStack, newFP, delta);
++
++		victimYieldFpOnNewStack = Magic.getCallerFramePointer(newFP);
++		victimYieldIPOnNewStack = Magic.getReturnAddress(newFP);
++	}
++
++	/**
++	 * Replace the execution of the current thread with some stolen work.
++	 */
++	@Interruptible
++	public static void wsSteal(java.lang.Thread victim) {
++		wsSteal(JikesRVMSupport.getThread(victim));
++	}
++
++	@Unpreemptible
++	private void wsCheckShadowStack(int length) {
++		if (wsShadowStack == null || wsShadowStack.length < length) {
++			wsShadowStack = MemoryManager.newStack(length);
++		}
++	}
++
++	/**
++	 * Replace the execution of the current thread with some stolen work.
++	 */
++	@Unpreemptible
++	public static void wsSteal(RVMThread victim) {
++		RVMThread.getCurrentThread().wsStealInternal(victim);
++	}
++
++	@Unpreemptible
++	public static void wsSteal_retbarrier(RVMThread victim) {
++		RVMThread.getCurrentThread().wsStealInternal_retbarrier(victim);
++	}
++
++	public Address stackTop() {
++		return stackTop(stack);
++	}
++
++	public Address stackTop(byte[] stack) {
++		return Magic.objectAsAddress(stack).plus(stack.length);
++	}
++
++	// debugging support
++	final protected static boolean wsDebugTrace = false;
++	private RVMThread wsDebugMyCurrentVictim = null;
++	private boolean wsDebugRBAlreadyInstalled = false;
++	// debugging support
++	@UnpreemptibleNoWarn
++	public static void dumpWSDetailsWhileDeliveringHardwareException() {
++		RVMThread me = getCurrentThread();
++		if(me.wsDebugMyCurrentVictim != null) {
++			VM.sysWriteln("============================================================================================================");
++			VM.sysWriteln("Trying to dump details of current work-stealing... Though it might be dangerous..");
++			VM.sysWriteln("My victim was thread ",me.wsDebugMyCurrentVictim.getId());
++			VM.sysWriteln("Did I installed a return barrier = ",me.iInstalledABarrier);
++			VM.sysWriteln("Did I found a pre-installed return barrier = ",me.wsDebugRBAlreadyInstalled);
++			if((!me.iInstalledABarrier && !me.wsDebugRBAlreadyInstalled) || !RVMThread.victimCanBeReleasedAfterRBarrierIsInstalled) {
++				VM.sysWriteln("First Trying to dump the original stack of victim");
++				dumpStack(me.wsDebugMyCurrentVictim.getContextRegisters().getInnermostInstructionAddress(), me.wsDebugMyCurrentVictim.getContextRegisters().getInnermostFramePointer());
++			}
++			if(me.iInstalledABarrier || me.wsDebugRBAlreadyInstalled) {
++				VM.sysWriteln("Dumping the hijacked addresses w.r.t return barrier at the victim: ");
++				VM.sysWriteln("Hijacked return address: ", me.wsDebugMyCurrentVictim.hijackedReturnAddress);
++				VM.sysWriteln("Callee fp: ", me.wsDebugMyCurrentVictim.hijackedReturnCalleeFp);
++				VM.sysWriteln("Caller fp: ", me.wsDebugMyCurrentVictim.hijackedReturnCallerFp);
++			}
++			if(me.iInstalledABarrier || me.wsDebugRBAlreadyInstalled) {
++				VM.sysWriteln("Now Trying to dump the cloned stack of victim");
++				dumpStack(me.wsDebugMyCurrentVictim.victimYieldIPOnNewStack, me.wsDebugMyCurrentVictim.victimYieldFpOnNewStack);
++			}
++			if(me.wsFrameCopier.debugStackFrameProcessing) {
++				VM.sysWriteln("Hardware Exception was actually generated inside StackFrameCopier.copyStack(.....)");
++				VM.sysWriteln("The fp being scanned was = ",me.wsFrameCopier.debugScanFp);
++				VM.sysWriteln("The ip being scanned was = ",me.wsFrameCopier.debugScanIp);
++			}
++			VM.sysWriteln("DONE dumping details of current work-stealing....");
++			VM.sysWriteln("============================================================================================================");
++		}
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	private boolean wsSafeToAttemptSteal() {
++		boolean safe = false;
++		wsLock().lockNoHandshake();
++		safe = !workstealingInProgress;
++		if(safe) {
++			workstealingInProgress = true;
++			if(!RVMThread.thiefCanInitiateStealFromAPreInstalledBarrier) wsReturnBarrierUninstalled = true;
++			if(wsDebugTrace) {
++				VM.sysWriteln(getCurrentThread().getId(),": Grabbed victim W-",getId());
++			}
++			final boolean barrierPreInstalled = thiefCanInitiateStealFromAPreInstalledBarrier && !wsReturnBarrierUninstalled;
++			if(barrierPreInstalled) {
++				/*
++				 * In this case, we can safely decide here if we really need to start
++				 * steal from this barrier. If there are no more continuations left
++				 * in the continuation list, then no need to use this barrier. Mark
++				 * it unusable and start stealing by yielding the victim.
++				 */
++				final boolean startStealFromBarrier = indexInContList < fpsInContList;
++				if(startStealFromBarrier) {
++					wsSafeToReturnFromBarrier = false;
++					if(wsDebugTrace) {
++						getCurrentThread().wsDebugRBAlreadyInstalled = true;
++						VM.sysWriteln(getCurrentThread().getId(),": RBarrier preinstalled on W-",getId());
++					}
++				}
++				else {
++					wsReturnBarrierUninstalled = true;
++					wsSafeToReturnFromBarrier = true;
++					if(wsDebugTrace) {
++						getCurrentThread().wsDebugRBAlreadyInstalled = true;
++						VM.sysWriteln(getCurrentThread().getId(),": RBarrier preinstalled But of no use on W-",getId());
++					}
++				}
++			}
++			fpsInContList = 0;
++			indexInContList = 0;
++		}
++		wsLock().unlock();
++		return safe;
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	private void wsFinishedStealing(boolean markBarrierUnusable) {
++		wsLock().lockNoHandshake();
++		workstealingInProgress = false;
++		if(markBarrierUnusable) {
++			wsSafeToReturnFromBarrier = true;
++			wsReturnBarrierUninstalled = true;
++			if(wsDebugTrace) {
++				VM.sysWriteln(getCurrentThread().getId(),": Marking the barrier unsuable and uninstalled for W-",getId());
++			}
++		}
++		if(wsWaitingInsideBarrier) {
++			if(wsDebugTrace) {
++				VM.sysWriteln(getCurrentThread().getId(),": Stealing done and broadcasting to come out of barrier to W-",getId());
++			}
++			// unlock victim from wait inside barrier
++			wsLock().broadcast();
++		}
++		else {
++			if(wsDebugTrace) {
++				VM.sysWriteln(getCurrentThread().getId(),": Stealing done but no broadcast to vicitm W-",getId());
++			}
++		}
++		wsLock().unlock();
++	}
++
++	@UnpreemptibleNoWarn
++	private void wsStealInternal(RVMThread victim) {
++		if (VM.VerifyAssertions) VM._assert(wsStealHead == null);
++		if (VM.VerifyAssertions) VM._assert(this != victim);
++		if (VM.VerifyAssertions) VM._assert(!wsFlag);
++
++		if(!victim.wsSafeToAttemptSteal()) return;
++
++		final long startStealCPUCycles = Magic.getTimeBase();
++
++		findAttempts++;
++
++		// Synchronize with victim
++		victim.beginPairHandshake();
++
++		if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = victim;
++
++		if (!victim.wsFlag) {
++			// Nothing to steal!
++			if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = null;
++			victim.endPairHandshake();
++			victim.wsFinishedStealing(false);
++			totalFailedStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++			return;
++		}
++
++		// Container for steal/join info.
++		WS.StealInfo steal = new WS.StealInfo();
++		WS.FinishInfo finish = new WS.FinishInfo();
++
++		// Ensure stack size now the victim is stopped, should rarely run.
++		wsCheckShadowStack(victim.stack.length);
++
++		// Copy the context registers from the victim.
++		Address ip, fp;
++		contextRegisters.clear();
++		victim.monitor().lockNoHandshake();
++		if (victim.getExecStatus() == RVMThread.BLOCKED_IN_JNI) {
++			ip = Address.zero();
++			fp = victim.getJNIEnv().topJavaFP();
++		} else {
++			ip = victim.getContextRegisters().getInnermostInstructionAddress();
++			fp = victim.getContextRegisters().getInnermostFramePointer();
++		}
++		victim.monitor().unlock();
++		contextRegisters.setInnermost(ip,fp);
++
++		// Search the victim for potential steals
++		int found = victim.wsFindSteal(contextRegisters, steal, finish);
++		if (found <= 1) victim.wsFlag = false;
++		if (found == 0) {
++			// Nothing to steal!
++			if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = null;
++			victim.endPairHandshake();
++			victim.wsFinishedStealing(false);
++			totalFailedStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++			return;
++		}
++		if(createContinuationDistribution) {
++			victim.continuationsDistribution(found);
++		}
++		// New head of our join info is the victims old head.
++		wsStealHead = steal.prev();
++		wsFinishHead = steal.finish;
++
++		// work out how much 
++		Address newTop = stackTop(wsShadowStack);
++		Address vicTop = victim.stackTop();
++		Offset offset = newTop.diff(vicTop);
++		Address newFP = newTop.minus(steal.fpOffset);
++
++		// fix up the stack and registers while walking the real stack
++		contextRegisters.inuse = true;
++		wsFrameCopier.copyStack(fp, ip, victim, this, contextRegisters, steal.fpOffset,
++				-1, offset, vicTop);
++		adjustRegisters(contextRegisters, offset);
++		if (VM.VerifyAssertions) {
++			Address testFp = newFP;
++			while (testFp.NE(ArchConstants.STACKFRAME_SENTINEL_FP)) {
++				VM._assert(testFp.GE(Magic.objectAsAddress(wsShadowStack)));
++				VM._assert(testFp.LT(stackTop(wsShadowStack)));
++				testFp = Magic.getCallerFramePointer(testFp);
++			}
++		}
++
++		// install new stack
++		byte[] temp = stack;
++		stack = wsShadowStack;
++		wsShadowStack = temp;
++
++		// jump into new stack by throwing an exception
++		VM.disableGC();
++		WS.incFinish(steal.finish);
++
++		int compiledMethodId = Magic.getCompiledMethodID(newFP);
++		CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++		Address catchBlockStart = compiledMethod.getInstructionAddress(true, steal.cbOffset);
++		contextRegisters.setInnermost(catchBlockStart, newFP);
++
++		totalSteals++;
++
++		if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = null;
++		victim.endPairHandshake();
++		totalSuccessStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++		victim.wsFinishedStealing(false);
++		stackLimit = Magic.objectAsAddress(stack).plus(STACK_SIZE_GUARD);
++		compiledMethod.getExceptionDeliverer().deliverException(compiledMethod, catchBlockStart, wsContinuation, contextRegisters);
++	}
++
++	@UnpreemptibleNoWarn
++	private void wsStealInternal_retbarrier(RVMThread victim) {
++		if (VM.VerifyAssertions) VM._assert(wsStealHead == null);
++		if (VM.VerifyAssertions) VM._assert(this != victim);
++		if (VM.VerifyAssertions) VM._assert(!wsFlag);
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Stealing from W-",victim.getId());
++		}
++
++		if(!victim.wsSafeToAttemptSteal()) return;
++
++		final long startStealCPUCycles = Magic.getTimeBase();
++		findAttempts++;
++
++		// check if return barrier is already installed
++		// No need to take wsLock(), as we have already told victim not
++		// to unwind from barrier (if any present)
++		final boolean barrierPreInstalled = thiefCanInitiateStealFromAPreInstalledBarrier && !victim.wsReturnBarrierUninstalled;
++
++		/*
++		 * ensure that the victim is stopped inside @BaselineSaveLSRegisters frame
++		 * so that thief can safely copy its frame and process callee save registers
++		 * offline.
++		 */
++		boolean wsSafeToInstallRBarrierInVictim = true;
++
++		if(!barrierPreInstalled) {
++			if(RVMThread.wsDebugTrace) {
++				VM.sysWriteln(this.getId(),": Attempting pairing with W-",victim.getId());
++			}
++
++			wsSafeToInstallRBarrierInVictim = victim.wsBeginPairHandshake();
++			victim.deInstallStackTrampoline();
++
++			if(RVMThread.wsDebugTrace) {
++				VM.sysWriteln(this.getId(),": Pairing done with W-",victim.getId());
++			}
++		}
++
++		if(RVMThread.wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Pairing done with W-",victim.getId());
++			wsDebugRBAlreadyInstalled = false;
++			wsDebugMyCurrentVictim = victim;
++		}
++
++		// Ensure stack size now the victim is stopped, should rarely run.
++		wsCheckShadowStack_retbarrier(victim);
++
++		if (!victim.wsFlag) {
++			if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = null;
++			if(wsDebugTrace) {
++				VM.sysWriteln(this.getId(),": wsFlag was false, releasing W-",victim.getId());
++			}
++			// Nothing to steal!
++			if(!barrierPreInstalled) {
++				victim.endPairHandshake();
++				totalFailedStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++			}
++			// No need to sum time for failed steal in case barrierPreInstalled
++			// because the only time lost by victim is what it waits inside
++			// handshake function inside the barrier. That place has its
++			// own timer hence no need for timing victim loss here.
++			victim.wsFinishedStealing(true);
++			return;
++		}
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Start searching continuation in W-",victim.getId());
++		}
++
++		// Container for steal/join info.
++		WS.StealInfo steal = new WS.StealInfo();
++		WS.FinishInfo finish = new WS.FinishInfo();
++
++		// Copy the context registers from the victim.
++		Address ip, fp;
++		contextRegisters.clear();
++		boolean victimBlockedInJNI = false;
++		if(!barrierPreInstalled) { 
++			victim.monitor().lockNoHandshake();
++			if (victim.getExecStatus() == RVMThread.BLOCKED_IN_JNI) {
++				ip = Address.zero();
++				fp = victim.getJNIEnv().topJavaFP();
++				victimBlockedInJNI = true;
++				if(wsDebugTrace) {
++					VM.sysWriteln(this.getId(),": Found blocked in JNI W-",victim.getId());
++				}
++
++			} else {
++				ip = victim.getContextRegisters().getInnermostInstructionAddress();
++				fp = victim.getContextRegisters().getInnermostFramePointer();
++			}
++			victim.wsSafeToReturnFromBarrier = false;
++			victim.monitor().unlock();
++		}
++		else {
++			fp = victim.victimYieldFpOnNewStack;
++			ip = victim.victimYieldIPOnNewStack;
++			preInstalledBarriers++;
++		}
++
++		contextRegisters.setInnermost(ip,fp);
++
++		Address vicTop = barrierPreInstalled ? victim.stackTop(victim.wsGetClonedStack()) : victim.stackTop();
++		// Search the victim for potential steals
++		int found = (victimBlockedInJNI || !wsSafeToInstallRBarrierInVictim) ? victim.wsFindSteal(contextRegisters, steal, finish) : victim.wsFindSteal_retBarrier(steal, finish, vicTop, barrierPreInstalled, startStealCPUCycles);
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(victim.getId(),": Total available continuations = ",found);
++		}
++
++		if (found <= 1 && !barrierPreInstalled) {
++			/*
++			 * If we started the steal from a return barrier and we discover
++			 * that found <=1 then it does not mean wsFlag=false for this victim.
++			 * There may be continuations available above the barrier, which can
++			 * be stolen by yielding the victim.
++			 */
++			victim.wsFlag = false;
++		}
++		if (found == 0) {
++			if(RVMThread.wsDebugTrace) wsDebugMyCurrentVictim = null;
++			//Nothing to steal means there was no return barrier installed
++			if(wsDebugTrace) {
++				VM.sysWriteln(this.getId(),": Nothing to steal, releasing W-",victim.getId());
++			}
++			if(!barrierPreInstalled) {
++				victim.wsSafeToReturnFromBarrier = true;
++				victim.endPairHandshake();
++				totalFailedStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++			}
++			// No need to sum time for failed steal in case barrierPreInstalled
++			// because the only time lost by victim is what it waits inside
++			// handshake function inside the barrier. That place has its
++			// own timer hence no need for timing victim loss here.
++
++			victim.wsFinishedStealing(true);
++			return;
++		}
++		if(createContinuationDistribution) {
++			victim.continuationsDistribution(found);
++		}
++
++		// update variables if I installed a barrier
++		if(iInstalledABarrier) {
++			vicTop =  victim.stackTop(victim.wsGetClonedStack());
++			fp = victim.victimYieldFpOnNewStack;
++			ip = victim.victimYieldIPOnNewStack;
++		}
++
++		// New head of our join info is the victims old head.
++		wsStealHead = steal.prev();
++		wsFinishHead = steal.finish;
++
++		// work out how much 
++		Address newTop = stackTop(wsShadowStack);
++		Offset offset = newTop.diff(vicTop);
++		Address newFP = newTop.minus(steal.fpOffset);
++
++		// fix up the stack and registers while walking the real stack
++		contextRegisters.inuse = true;
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Start processing frames from W-",victim.getId());
++		}
++
++		wsFrameCopier.copyStack(fp, ip, victim, this, contextRegisters, steal.fpOffset, 
++				-1, offset, vicTop);
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Done processing stolen frames from W-",victim.getId());
++		}
++
++		WS.incFinish(steal.finish);
++
++		final boolean canReleaseNow = (iInstalledABarrier || barrierPreInstalled) && RVMThread.victimCanBeReleasedAfterRBarrierIsInstalled;
++
++		if(canReleaseNow) {
++			final boolean isBarrierUnusable = (found == 1) && (iInstalledABarrier||barrierPreInstalled);
++			victim.wsFinishedStealing(isBarrierUnusable);
++			if(wsDebugTrace) {
++				VM.sysWriteln(this.getId(),": Releasing from barrier by marking workstealing done for W-",victim.getId());
++			}
++			iInstalledABarrier = false;
++		}
++
++		adjustRegisters(contextRegisters, offset);
++
++		if (VM.VerifyAssertions) {
++			Address testFp = newFP;
++			while (testFp.NE(ArchConstants.STACKFRAME_SENTINEL_FP)) {
++				VM._assert(testFp.GE(Magic.objectAsAddress(wsShadowStack)));
++				VM._assert(testFp.LT(stackTop(wsShadowStack)));
++				testFp = Magic.getCallerFramePointer(testFp);
++			}
++		}
++
++		// install new stack
++		byte[] temp = stack;
++		stack = wsShadowStack;
++		wsShadowStack = temp;
++
++		// jump into new stack by throwing an exception
++		VM.disableGC();
++
++		if(wsDebugTrace) {
++			wsDebugMyCurrentVictim = null;
++			VM.sysWriteln(this.getId(),": Stealing Done from W-",victim.getId());
++		}
++
++		int compiledMethodId = Magic.getCompiledMethodID(newFP);
++		CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++		Address catchBlockStart = compiledMethod.getInstructionAddress(true, steal.cbOffset);
++
++		totalSteals++;
++
++		if(!canReleaseNow) {
++			victim.endPairHandshake();
++			totalSuccessStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles); 
++			victim.wsFinishedStealing(false);
++		}
++
++		if(wsDebugTrace) {
++			VM.sysWriteln(this.getId(),": Throwing exception to start continuation");
++		}
++
++		contextRegisters.setInnermost(catchBlockStart, newFP);	//return barrier
++		stackLimit = Magic.objectAsAddress(stack).plus(STACK_SIZE_GUARD);
++		compiledMethod.getExceptionDeliverer().deliverException(compiledMethod, catchBlockStart, wsContinuation, contextRegisters);
++	}
++
++	/**
++	 * Implement join functionality. This is always run by the victim, and there are basically two paths here.
++	 * 
++	 * 1) The victim stops and decrements the finish.
++	 * 2) Control is returned to the victim to push some result into the finish state (after which it calls completeJoin). 
++	 */
++	@Inline
++	@Unpreemptible
++	public void wsJoinInternal(Address fp, Address ip) {
++		// Medium-path check for unnecessary join call.
++		Offset fpOffset = stackTop().diff(fp);
++		if (wsStealHead == null || !wsStealHead.matches(fpOffset)) {
++			return;
++		}
++
++		int compiledMethodId = Magic.getCompiledMethodID(fp);
++		CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++		Offset ipOffset = compiledMethod.getInstructionOffset(ip);
++		Offset cbOffset = compiledMethod.findCatchBlockForInstruction(ipOffset, RVMType.WSContinuationType, true);
++		if (!wsStealHead.matches(fpOffset, cbOffset)) {
++			// Another check just to make sure we are doing the right thing
++			return;
++		}
++
++		cbOffset = compiledMethod.findCatchBlockForInstruction(ipOffset, RVMType.WSJoinType, true);
++		if (cbOffset.sGE(Offset.zero())) {
++			// This join wants to return data to the finish.
++			wsInJoin = true;
++			wsJoin.finish = wsStealHead.finish;
++			RuntimeEntrypoints.athrow(wsJoin);
++		}
++		wsCompleteJoinInternal();
++	}
++
++	@NoInline
++	@UnpreemptibleNoWarn
++	public void wsCompleteFinishInternal() {
++		ObjectModel.genericUnlock_internal(wsFinishHead);
++		wsInJoin = false;
++		wsFlag = false;
++		wsStealHead = null;
++		wsFinishHead = null;
++		wsSpecialNVMap = 0;
++		if(RVMThread.wsRetBarrier) {
++			resetTramoplineInfo_unlocked();
++			WS.searchForWork_retbarrier();
++		}
++		else {
++			WS.searchForWork();
++		}
++	}
++
++	@NoInline
++	@UnpreemptibleNoWarn
++	public void wsCompleteJoinInternal() {
++		WS.StealInfo steal = wsStealHead;
++		if (WS.decFinish(steal.finish)) {
++			// We are going to run the finish...
++			VM.disableGC();
++			Magic.saveThreadState(contextRegisters);
++			Address fp = contextRegisters.getInnermostFramePointer();
++			Address top = stackTop();
++			// Search for the right frame.
++
++			while (top.diff(fp).NE(wsFinishHead.fpOffset)) {
++				if (VM.VerifyAssertions) VM._assert(fp.NE(STACKFRAME_SENTINEL_FP));
++				int compiledMethodId = Magic.getCompiledMethodID(fp);
++				if (compiledMethodId == INVISIBLE_METHOD_ID) {
++					contextRegisters.unwindStackFrame();
++				} else {
++					CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++					ExceptionDeliverer exceptionDeliverer = compiledMethod.getExceptionDeliverer();
++					exceptionDeliverer.unwindStackFrame(compiledMethod, contextRegisters);
++				}
++				fp = contextRegisters.getInnermostFramePointer();
++			}
++
++			int compiledMethodId = Magic.getCompiledMethodID(fp);
++			CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++			Address catchBlockStart = compiledMethod.getInstructionAddress(true, wsFinishHead.cbOffset);
++			contextRegisters.setInnermost(catchBlockStart, fp);
++			contextRegisters.inuse = true;
++			stackLimit = Magic.objectAsAddress(stack).plus(STACK_SIZE_GUARD);
++			wsFinish.data = wsFinishHead;
++			wsInJoin = false;
++			wsSpecialNVMap = 0;
++			wsStealHead = wsFinishHead.steal;
++			wsFinishHead = wsFinishHead.prev();
++			compiledMethod.getExceptionDeliverer().deliverException(compiledMethod, catchBlockStart, wsFinish, contextRegisters);
++			// Not reached
++		}
++		wsInJoin = false;
++		wsFlag = false;
++		wsStealHead = null;
++		wsFinishHead = null;
++		wsSpecialNVMap = 0;
++		if(wsRetBarrier) {
++			resetTramoplineInfo_unlocked();
++			WS.searchForWork_retbarrier();
++		}
++		else {
++			WS.searchForWork();
++		}
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	public Address getAddressValueOnClonedStack(final Address fp) {
++		if(fp.isZero()) return fp;
++		else return stackTop(wsVictimShadowStack).minus(stackTop().diff(fp));
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	private Address getAddressValueOnMainStack(final Address fp) {
++		return stackTop().minus(stackTop(wsVictimShadowStack).diff(fp));
++	}
++
++	/**
++	 * Search through a potential victim's stack, and find:
++	 *
++	 *   1) The oldest continuation that can be stolen
++	 *   2) The enclosing finish for this continuation.
++	 * 
++	 * The passed JoinInfo and FinishInfo classes are populated
++	 * accordingly if a steal is found.
++	 *
++	 * @param top
++	 * @param registers
++	 * @param info
++	 * @return
++	 */
++	@UnpreemptibleNoWarn
++	@Inline
++	private int wsFindSteal(Registers registers, WS.StealInfo steal, WS.FinishInfo finish) {
++		int found = 0;
++		boolean skip = wsInJoin;
++		Address fp = registers.getInnermostFramePointer();
++		Address top = stackTop();
++		Offset stealCBOffset = Offset.zero();
++		Offset stealFPOffset = Offset.zero();
++		Offset finishCBOffset = Offset.zero();
++		Offset finishFPOffset = Offset.zero();
++		Address prevFp = Address.zero();
++		Address stealPrevFp = Address.zero();
++		Address finishPrevFp = Address.zero();
++
++		boolean foundStolen = false;
++		boolean foundFinish = true;
++		while (Magic.getCallerFramePointer(fp).NE(STACKFRAME_SENTINEL_FP)) {
++			Offset fpOffset = top.diff(fp);
++			int compiledMethodId = Magic.getCompiledMethodID(fp);
++			if (compiledMethodId != INVISIBLE_METHOD_ID) {
++				CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++				if (compiledMethod.getCompilerType() == CompiledMethod.OPT || compiledMethod.getCompilerType() == CompiledMethod.BASELINE) {
++					// Process each normal stack frame.
++					// First we search for the oldest unstolen continuation. Once we hit an already stolen continuation or reach the end we are done.
++					// We also need to know the enclosing finish block.
++					// We need to try and find the outermost finish block for each method to make sure. 
++
++					Address ip = registers.getInnermostInstructionAddress();
++					Offset ipOffset = compiledMethod.getInstructionOffset(ip);
++
++					Offset currentIPOffset = ipOffset;
++					Offset finishIPOffset = ipOffset;
++
++					// Search for a continuation to steal.
++					if (!foundStolen) {
++						while (true) {
++							Offset catchBlock = compiledMethod.findCatchBlockForInstruction(currentIPOffset, RVMType.WSContinuationType, true);
++							if (catchBlock.sLT(Offset.zero())) break;
++							if (wsStealHead != null && wsStealHead.find(fpOffset, catchBlock) != null) {
++								// This continuation has already been stolen, so we discard the current state. 
++								foundStolen = true;
++								break;
++							}
++							// This continuation has not been stolen, so we update info to reflect it.
++							if (!skip) {
++								finishIPOffset = currentIPOffset;
++								stealCBOffset = catchBlock;
++								stealFPOffset = fpOffset;
++								stealPrevFp = prevFp;
++								found++;
++								foundFinish = false;
++							}
++							skip = false;
++							// Advance into the catch block
++							currentIPOffset = catchBlock.plus(1);
++						}
++					}
++
++					// Search for an enclosing finish.
++					if (!foundFinish) {
++						Offset catchBlock = compiledMethod.findCatchBlockForInstruction(finishIPOffset, RVMType.WSFinishType, true);
++						if (catchBlock.sGE(Offset.zero())) {
++							// We found a finish block.
++							finishCBOffset = catchBlock;
++							finishFPOffset = fpOffset;
++							finishPrevFp = prevFp;
++							foundFinish = true;
++							if (foundStolen) {
++								// We know the continuation we are stealing, and we have found the first finish.
++								break;
++							}
++						}
++					}
++				}
++			}
++			registers.unwindStackFrame();
++			prevFp = fp;
++			fp = registers.getInnermostFramePointer();
++		}
++		if (found > 0) {
++			// Find the finish object to use.
++			if (foundFinish) {
++				// Look for an existing finish.
++				if (wsFinishHead != null) {
++					steal.finish = wsFinishHead.find(finishFPOffset, finishCBOffset);
++				}
++				if (steal.finish == null) {
++					// We are the first to use this finish.
++					finish.set(finishFPOffset, finishCBOffset);
++					finish.setPrev(wsFinishHead);
++					steal.finish = finish;
++					wsFinishHead = finish;
++
++					WS.installJoinInstructions(top.minus(finishFPOffset), finishPrevFp);
++				}
++			} else {
++				// We must be delivering back to a parent finish.
++				steal.finish = wsFinishHead;
++			}
++			WS.installJoinInstructions(top.minus(stealFPOffset), stealPrevFp);
++			steal.set(stealFPOffset, stealCBOffset);
++			steal.setPrev(wsStealHead);
++			wsStealHead = steal;
++			if (VM.VerifyAssertions) VM._assert(steal.finish != null);
++		}
++		return found;
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	private void saveContinuation(final Address fp, final boolean mainStack) {
++		if(fpsInContList == RVMThread.ARRAY_OF_CONTINUATIONS_MAXSIZE) {
++			// reset index
++			fpsInContList = RVMThread.ON_OVERFLOW_RESTART_INDEX_IN_ARRAY_OF_CONTINUATIONS;
++		}
++		final Address fpStore = mainStack ? getAddressValueOnMainStack(fp) : fp;
++		array_of_continuations.set(fpsInContList++, fpStore);
++	}
++
++	@UnpreemptibleNoWarn
++	@Inline
++	private int wsFindSteal_retBarrier(WS.StealInfo steal, WS.FinishInfo finish, Address top, boolean initiateStealFromBarrier, long startStealCPUCycles) {
++		Address fp = initiateStealFromBarrier ? getAddressValueOnClonedStack(hijackedReturnCallerFp) : this.contextRegisters.getInnermostFramePointer();
++		Address ip = initiateStealFromBarrier ? hijackedReturnAddress : this.contextRegisters.getInnermostInstructionAddress();
++
++		int found = 0;
++		boolean skip = wsInJoin;
++		Offset stealCBOffset = Offset.zero();
++		Offset stealFPOffset = Offset.zero();
++		Offset finishCBOffset = Offset.zero();
++		Offset finishFPOffset = Offset.zero();
++
++		Address stealPrevFp = initiateStealFromBarrier ? getAddressValueOnClonedStack(hijackedReturnCalleeFp) : Address.zero();
++
++		Address finishPrevFp = stealPrevFp;
++		Address prevFp = stealPrevFp;
++
++		boolean foundStolen = false;
++		boolean foundFinish = true;
++
++		Address prevJavaFrameFp = Address.zero();
++		boolean firstContinuationFound = false;
++		boolean barrierInstalled = false;
++
++		while (Magic.getCallerFramePointer(fp).NE(STACKFRAME_SENTINEL_FP)) {
++			final Offset fpOffset = top.diff(fp);
++			final int compiledMethodId = Magic.getCompiledMethodID(fp);
++			if (compiledMethodId != INVISIBLE_METHOD_ID) {
++				final CompiledMethod compiledMethod = CompiledMethods.getCompiledMethod(compiledMethodId);
++				if (compiledMethod.getCompilerType() == CompiledMethod.OPT || compiledMethod.getCompilerType() == CompiledMethod.BASELINE) {
++					// Process each normal stack frame.
++					// First we search for the oldest unstolen continuation. Once we hit an already stolen continuation or reach the end we are done.
++					// We also need to know the enclosing finish block.
++					// We need to try and find the outermost finish block for each method to make sure. 
++					final Offset ipOffset = compiledMethod.getInstructionOffset(ip);	// it has debug info
++
++					Offset currentIPOffset = ipOffset;
++					Offset finishIPOffset = ipOffset;
++					// Search for a continuation to steal.
++					if (!foundStolen) {
++						while (true) {
++							final Offset catchBlock = compiledMethod.findCatchBlockForInstruction(currentIPOffset, RVMType.WSContinuationType, true);
++							if (catchBlock.sLT(Offset.zero())) break;
++							if (wsStealHead != null && wsStealHead.find(fpOffset, catchBlock) != null) {
++								// This continuation has already been stolen, so we discard the current state. 
++								foundStolen = true;
++								break;
++							}
++							// This continuation has not been stolen, so we update info to reflect it.
++							if (!skip) {
++								if(initiateStealFromBarrier) {
++									if(!prevJavaFrameFp.isZero()) {
++										saveContinuation(prevJavaFrameFp, true);
++									}
++								}
++								else {
++									if(!prevJavaFrameFp.isZero() && firstContinuationFound) {
++										saveContinuation(prevJavaFrameFp, false);
++									}
++									//install return barrier for the callee of the newest continuation on victim stack
++									else if(!prevJavaFrameFp.isZero() && !firstContinuationFound) {
++										firstContinuationFound = true;
++									}
++								}
++								finishIPOffset = currentIPOffset;
++								stealCBOffset = catchBlock;
++								stealFPOffset = fpOffset;
++								stealPrevFp = prevFp;
++								found++;
++								foundFinish = false;
++							}
++							skip = false;
++							// Advance into the catch block
++							currentIPOffset = catchBlock.plus(1);
++						}
++					}
++
++					// Search for an enclosing finish.
++					if (!foundFinish) {
++						Offset catchBlock = compiledMethod.findCatchBlockForInstruction(finishIPOffset, RVMType.WSFinishType, true);
++						if (catchBlock.sGE(Offset.zero())) {
++							// We found a finish block.
++							finishCBOffset = catchBlock;
++							finishFPOffset = fpOffset;
++							finishPrevFp = prevFp;
++							foundFinish = true;
++						}
++					}
++					if(!initiateStealFromBarrier && firstContinuationFound && !barrierInstalled) {
++						final RVMThread me = getCurrentThread();
++						me.iInstalledABarrier = true;
++						barrierInstalled = true;
++						wsReturnBarrierUninstalled = false;
++						if(wsDebugTrace) {
++							VM.sysWriteln(getCurrentThread().getId(),": Cloning stack of W-",getId());
++						}
++						victimYieldFpOnNewStack = wsCloneVictimStack(this, this.contextRegisters.getInnermostFramePointer());
++						//keep a copy of the gprs obtained by stackwalk of only the topmost frame of this yielded victim
++						if(wsDebugTrace) {
++							VM.sysWriteln(getCurrentThread().getId(),": Going to install return barrier in W-",getId());
++						}
++						wsInstallStackTrampolineBridge(prevJavaFrameFp);
++						thiefInstalledBarriers++;
++						if(wsDebugTrace) {
++							VM.sysWriteln(getCurrentThread().getId(),": Installed rbarrier in W-",getId());
++						}
++						if(RVMThread.victimCanBeReleasedAfterRBarrierIsInstalled) {
++							endPairHandshake();
++						}
++						me.totalSuccessStealCPUCycles += (Magic.getTimeBase() - startStealCPUCycles);
++					}
++					prevJavaFrameFp = fp;
++					if(foundStolen && foundFinish) break;
++				}
++				else {
++					prevJavaFrameFp = Address.zero();
++				}
++			}
++			ip = RVMThread.getReturnAddress(fp);
++			prevFp = fp;
++			fp = Magic.getCallerFramePointer(prevFp);
++		}
++
++		if (found > 0) {
++			// Notify the victim to awake if its waiting inside return barrier
++			if(initiateStealFromBarrier || barrierInstalled) {
++				if(wsDebugTrace) {
++					VM.sysWriteln(getCurrentThread().getId(),": Send broadcast to release from barrier to W-",getId());
++				}
++				wsUnlockFromReturnBarrier();
++			}
++
++			// Find the finish object to use.
++			if (foundFinish) {
++				// Look for an existing finish.
++				if (wsFinishHead != null) {
++					steal.finish = wsFinishHead.find(finishFPOffset, finishCBOffset);
++				}
++				if (steal.finish == null) {
++					// We are the first to use this finish.
++					finish.set(finishFPOffset, finishCBOffset);
++					finish.setPrev(wsFinishHead);
++					steal.finish = finish;
++					wsFinishHead = finish;
++					if (VM.VerifyAssertions) VM._assert(finishPrevFp.GE(stealPrevFp));	//return barrier
++					if(!initiateStealFromBarrier) WS.installJoinInstructions(top.minus(finishFPOffset), finishPrevFp, this);
++					else WS.installJoinInstructions(stackTop().minus(finishFPOffset), getAddressValueOnMainStack(finishPrevFp), this);
++				}
++			} else {
++				// We must be delivering back to a parent finish.
++				steal.finish = wsFinishHead;
++			}
++
++			if(!initiateStealFromBarrier) {
++				WS.installJoinInstructions(top.minus(stealFPOffset), stealPrevFp, this);
++				// install join instruction in the coloned stack as well
++				final Address retAddress = stealPrevFp.EQ(hijackedReturnCalleeFp) ? hijackedReturnAddress : RVMThread.getReturnAddress(stealPrevFp);
++				Magic.setReturnAddress(getAddressValueOnClonedStack(stealPrevFp), retAddress);
++				steal.set(stealFPOffset, stealCBOffset, stealPrevFp);
++			}
++			else {
++				final Address stealPrevFpOnMainStack = getAddressValueOnMainStack(stealPrevFp);
++				WS.installJoinInstructions(stackTop().minus(stealFPOffset), stealPrevFpOnMainStack, this);
++				final Address retAddress = stealPrevFpOnMainStack.EQ(hijackedReturnCalleeFp) ? hijackedReturnAddress : RVMThread.getReturnAddress(stealPrevFpOnMainStack);
++				Magic.setReturnAddress(stealPrevFp, retAddress);
++				steal.set(stealFPOffset, stealCBOffset, stealPrevFpOnMainStack);
++			}
++
++			steal.setPrev(wsStealHead);
++			wsStealHead = steal;
++			if (VM.VerifyAssertions) VM._assert(steal.finish != null);
++		}
++
++		return found;
++	}
+ }
+diff -r 189a5647ca94 tools/bootloader/RunBootImage.cpp
+--- a/tools/bootloader/RunBootImage.cpp	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/RunBootImage.cpp	Mon Aug 31 23:58:51 2015 -0500
+@@ -105,7 +105,7 @@
+ static const int BOOTCLASSPATH_A_INDEX         = BOOTCLASSPATH_P_INDEX+1;
+ static const int PROCESSORS_INDEX              = BOOTCLASSPATH_A_INDEX+1;
+ 
+-static const int numNonstandardArgs      = PROCESSORS_INDEX+1;
++static const int numNonstandardArgs      = PROCESSORS_INDEX+11;
+ 
+ static const char* nonStandardArgs[numNonstandardArgs] = {
+   "-X",
+@@ -128,6 +128,16 @@
+   "-Xbootclasspath/p:",
+   "-Xbootclasspath/a:",
+   "-X:availableProcessors=",
++  "-Xws:pinAuto=",
++  "-Xws:pinMap=",
++  "-Xws:pinLog=",
++  "-Xws:pinSocketCPU=",
++  "-Xws:pinMapSys=",
++  "-Xws:perfEvent=",
++  "-Xws:pinMapGC=",
++  "-Xws:retBarrier=",
++  "-Xws:procs=",
++  "-Xws:stats=",
+ };
+ 
+ // a NULL-terminated list.
+@@ -162,6 +172,29 @@
+   "  -Xbootclasspath/a:<cp>     (a)ppend specified classpath to bootclasspath",
+   "  -X:availableProcessors=<n> desired level of application parallelism (set",
+   "                             -X:gc:threads to control gc parallelism)",
++  "#====================================================================================",
++  "#============== WORK-STEALING SPECIFIC OPTIONS ======================================",
++  "#====================================================================================",
++  "#1. THREAD PINNING SPECIFIC......",
++  "  -Xws:pinAuto=<true/false>  Pin work-stealing threads to core id",
++  "  -Xws:pinMap=<0:2:4:6...>   Provide cpu map to pin the worker-stealing threads",
++  "  -Xws:pinLog=<true/false>   Print cpu id on which each work-stealing threads are running",
++  "				 (printing is done at the launch and end of application)",
++  "  -Xws:pinSocketCPU=<1:8>    Provide number of sockets and number of cpus available",
++  "				 (format is num_sockets:num_cpus_per_socket)",
++  "  -Xws:pinMapSys=<0:2...>    Provide set of cpus where system threads should run",
++  "                             This also includes GC threads if they are not pinned separately",
++  "  -Xws:pinMapGC=<0:1...>     Provide set of cpus where GC threads should run",
++  "                             map should be for each and every GC threads",
++  "#2. LINUX PERF EVENTS COUNTERS...",
++  "  -Xws:perfEvent=<true>      True if want to measure per thread performance counter events", 
++  "#3. NORMAL USAGE...",
++  "  -Xws:retBarrier=<true>     Use return barrier to reduce the steal time",
++  "                             default option is false",
++  "  -Xws:procs=<number>        Total work-stealing worker threads",
++  "  -Xws:stats=<true>          Display work-stealing statistics. Useful in a large project",
++  "			        where you dont know where exactly main method is being called.",
++  "                             The default option is false",
+   NULL                         /* End of messages */
+ };
+ 
+diff -r 189a5647ca94 tools/bootloader/bootImageRunner.h
+--- a/tools/bootloader/bootImageRunner.h	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/bootImageRunner.h	Mon Aug 31 23:58:51 2015 -0500
+@@ -24,6 +24,10 @@
+ #include <mach/mach_time.h>
+ #endif
+ 
++#ifndef RVM_FOR_MACOS
++#include <linux/unistd.h>
++#endif
++
+ #include <setjmp.h>
+ 
+ #ifdef __cplusplus
+diff -r 189a5647ca94 tools/bootloader/sys.h
+--- a/tools/bootloader/sys.h	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/sys.h	Mon Aug 31 23:58:51 2015 -0500
+@@ -43,6 +43,11 @@
+ #define EXTERNAL
+ #endif
+ 
++#ifdef RVM_WITH_LIBNUMA
++#include <numa.h>
++#include <numaif.h>
++#endif
++
+ #if (defined RVM_FOR_LINUX) && (defined RVM_FOR_HARMONY)
+ #define LINUX
+ #endif
+diff -r 189a5647ca94 tools/bootloader/sysMemory.cpp
+--- a/tools/bootloader/sysMemory.cpp	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/sysMemory.cpp	Mon Aug 31 23:58:51 2015 -0500
+@@ -221,6 +221,9 @@
+ {
+   TRACE_PRINTF("%s: sysMMapErrno %p %d %d %d %d %d\n",
+                Me, start, length, protection, flags, fd, offset);
++  #ifdef RVM_WITH_LIBNUMA
++  numa_set_localalloc();
++  #endif
+   void* res = mmap(start, (size_t)(length), protection, flags, fd, (off_t)offset);
+   if (res == (void *) -1) {
+     ERROR_PRINTF("%s: sysMMapErrno %p %d %d %d %d %d failed with %d.\n",
+diff -r 189a5647ca94 tools/bootloader/sysPerfEvent.cpp
+--- a/tools/bootloader/sysPerfEvent.cpp	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/sysPerfEvent.cpp	Mon Aug 31 23:58:51 2015 -0500
+@@ -31,7 +31,17 @@
+   void sysPerfEventEnable() {}
+   void sysPerfEventDisable() {}
+   void sysPerfEventRead(int id, long long *values) {}
++  void sysPerfEventInit_thread(int events) {}
++  void sysPerfEventCreate_thread(int id, const char *eventName) {}
++  void sysPerfEventOpen_thread(int id, void*tid, int *fds) {}
++  void sysPerfEventClose_thread(int id, int *fds) {}
++  void sysPerfEventEnable_thread(int *fds, int numEvents) {}
++  void sysPerfEventDisable_thread(int *fds, int numEvents) {}
++  void sysPerfEventRead_thread(int id, int *fds, uint64_t *values) {}
+ #else
++  static int perfVerbose = 0;
++  static struct perf_event_attr *perf_event_attrs_thread;
++  extern "C" Word sysGetThreadId();
+   static int enabled = 0;
+   static int *perf_event_fds;
+   static struct perf_event_attr *perf_event_attrs;
+@@ -107,5 +117,89 @@
+       errx(1, "read of perf event did not return 3 64-bit values");
+     }
+   }
++
++  void sysPerfEventInit_thread(int numEvents)
++ {
++   int ret = pfm_initialize();
++   if (ret != PFM_SUCCESS) {
++     errx(1, "error in pfm_initialize: %s", pfm_strerror(ret));
++   }
++ 
++   perf_event_attrs_thread = (struct perf_event_attr *)calloc(numEvents, sizeof(struct perf_event_attr));
++   if (!perf_event_attrs_thread) {
++     errx(1, "error allocating perf_event_attrs_thread");
++   }
++   for(int i=0; i < numEvents; i++) {
++     perf_event_attrs_thread[i].size = sizeof(struct perf_event_attr);
++   }
++  // enabled = 1;
++ }
++ 
++ void sysPerfEventCreate_thread(int id, const char *eventName)
++ {
++   struct perf_event_attr *pe = (perf_event_attrs_thread + id);
++   int ret = pfm_get_perf_event_encoding(eventName, PFM_PLM3, pe, NULL, NULL);
++   if (ret != PFM_SUCCESS) {
++     errx(1, "error creating event %d '%s': %s\n", id, eventName, pfm_strerror(ret));
++   }
++   pe->read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
++   pe->disabled = 1;
++   pe->inherit = 0;
++ }
++ 
++ void sysPerfEventClose_thread(int id, int *fds) {
++   close(fds[id]);
++ }
++ 
++ void sysPerfEventOpen_thread(int id, void* tid, int *fds) {
++   struct perf_event_attr *pe = (perf_event_attrs_thread + id);
++   fds[id] = perf_event_open(pe, 0, -1, -1, 0);
++   if (fds[id] == -1) {
++     err(1, "error in perf_event_open for event %d", id);
++   }
++   if(perfVerbose)
++     printf("Create Counter %d at fd %d for thread %d\n", id, fds[id],sysGetThreadId());
++ }
++ 
++ void sysPerfEventEnable_thread(int *fds, int numEvents)
++ {
++ 	int i;
++ 	for(i=0; i< numEvents; i++) {
++ 		if (ioctl(fds[i], PERF_EVENT_IOC_ENABLE, 0)) {
++ 			err(1, "error enabling perf event");
++ 		}
++ 	}
++ }
++ 
++ void sysPerfEventDisable_thread(int *fds, int numEvents)
++ {
++ 	int i;
++ 	for(i=0; i< numEvents; i++) {
++ 		if (ioctl(fds[i], PERF_EVENT_IOC_DISABLE, 0)) {
++ 			err(1, "error disabling perf event");
++ 		}
++ 	}
++ }
++ 
++ void sysPerfEventRead_thread(int id, int *fds, uint64_t *values)
++ {
++   if (fds[id] < 0) {
++ 	  printf("ERROR: reading event %d\n",id);
++ 	  return;
++   }
++   memset(values, 0, sizeof(uint64_t) * 3);
++   size_t expectedBytes = 3 * sizeof(uint64_t);
++   int ret = read(fds[id], values, expectedBytes);
++   if (ret < 0) {
++     err(1, "error reading event: %s", strerror(errno));
++   }
++   if (ret != expectedBytes) {
++     errx(1, "read of perf event did not return 3 64-bit values");
++   }
++   if(perfVerbose)
++     printf("Counter %d at fd %d: value %lld\n",sysGetThreadId(),fds[id], values[0]);
++   close(fds[id]);
++   fds[id] = -1;
++ }
+ #endif
+ }
+diff -r 189a5647ca94 tools/bootloader/sysThread.cpp
+--- a/tools/bootloader/sysThread.cpp	Fri Apr 24 08:29:05 2015 +0200
++++ b/tools/bootloader/sysThread.cpp	Mon Aug 31 23:58:51 2015 -0500
+@@ -466,6 +466,83 @@
+ #endif
+ }
+ 
++
++/*
++ * Thread Pinning Support for JavaWS (Try-Catch) Work-Stealing
++ * From here---->
++ */
++
++extern "C" {
++#ifndef RVM_WITH_LIBNUMA
++int sysCheckNUMAnode(void* memory) { return -1;}
++#else
++int sysCheckNUMAnode(void* memory) {
++  int status[1];
++  int ret_code;
++  status[0]=-1;
++  ret_code=move_pages(0 /*self memory */, 1, &memory, NULL, status, 0);
++  if(ret_code != 0) {
++    fprintf(stderr,"sysCheckNUMAnode failed (errno=%d)\n",ret_code);
++    exit(1);
++  }
++  return status[0];
++}
++#endif
++}
++
++#ifndef RVM_FOR_MACOS
++static cpu_set_t ws_sysThread_cpuset;
++#endif
++
++extern "C" void
++wsIniatilizeSysThreadBindMask(int cpuMask) {
++#ifndef RVM_FOR_MACOS
++	static int first = 0;
++	if(first == 0) {
++		CPU_ZERO(&ws_sysThread_cpuset);
++		first = 1;
++	}
++	CPU_SET( cpuMask, &ws_sysThread_cpuset );
++#endif
++}
++
++extern "C" void
++wsThreadBindMaskSet( int cpuMask ) {
++#ifndef RVM_FOR_HARMONY || RVM_FOR_MACOS
++#ifdef RVM_FOR_LINUX
++	cpu_set_t cpuset;
++	CPU_ZERO(&cpuset);
++	CPU_SET( cpuMask, &cpuset );
++	pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
++#endif
++#endif
++}
++
++extern "C" void
++sysThreadBindMaskSet() {
++#ifndef RVM_FOR_HARMONY 
++#ifdef RVM_FOR_LINUX
++#ifndef RVM_FOR_MACOS
++	pthread_setaffinity_np(pthread_self(), sizeof(ws_sysThread_cpuset), &ws_sysThread_cpuset);
++#endif
++#endif
++#endif
++}
++
++extern "C" int
++sysGetCPU( ) {
++#ifndef RVM_FOR_HARMONY || RVM_FOR_MACOS
++#ifdef RVM_FOR_LINUX
++	return sched_getcpu();
++#endif
++#endif
++}
++
++/*
++ * Till Here <----
++ * Thread Pinning Support for JavaWS (Try-Catch) Work-Stealing
++ */
++
+ // Routines to support sleep/wakeup of idle threads
+ 
+ /**
+@@ -478,7 +555,11 @@
+ EXTERNAL Word sysGetThreadId()
+ {
+   TRACE_PRINTF("%s: sysGetThreadId\n", Me);
+-  return (Word)getThreadId();
++  #ifndef RVM_FOR_MACOS
++  return (Word)(pid_t)syscall(__NR_gettid);
++  #else
++  return NULL;
++  #endif
+ }
+ 
+ EXTERNAL void* getThreadId()
