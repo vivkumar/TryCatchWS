@@ -1,7 +1,9 @@
 This is the software implementation of JikesRVM Java Try-Catch work-stealing framework (TryCatchWS). This software contains the following (each directory has its own readme file for clarity and usage):
 
 1) Patch files against Jikes RVM to supported Try-Catch work-stealing,
+
 2) Few simple Java testcases to demonstrate the usage,
+
 3) JastAdd compiler jar file to inject Try-Catch code blocks to support work-stealing.
 
 
@@ -9,6 +11,7 @@ You may use this software for your research. This software is still evolving at 
 
 BibTex:
 
+```latex
 @Inproceedings{KumarWS2012,
    author = {Kumar, Vivek and Frampton, Daniel and Blackburn, Stephen M. and Grove, David and Tardieu, Olivier},
    title = {Work-stealing Without the Baggage},
@@ -32,7 +35,7 @@ BibTex:
    doi = {10.1145/2576195.2576207},
    publisher = {ACM},
 } 
-
+```
 Or:
 
 V. Kumar, D. Frampton, S. M. Blackburn, D. Grove, and O. Tardieu. Work-stealing without the baggage. In Proceedings of the ACM International Conference on Object Oriented Programming Systems Languages and Applications, OOPSLA '12, pages 297–314, New York, NY, USA, 2012.
