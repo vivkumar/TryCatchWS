@@ -25,9 +25,9 @@ public class QuickSort {
 
 	private static void qsort(final int[] data, final int left, final int right) {
 		final int index = partition(data, left, right);
-		syncsteal {
+		finish {
 			if (left < index - 1) {
-				steal {
+				async {
 					qsort(data, left, index - 1);
 				}
 			}

@@ -19,7 +19,7 @@
  */
 
 /*
- * Vivek Kumar: Ported to JavaTC work-stealing.  
+ * Vivek Kumar: Ported to JavaTC work-asyncing.  
  */
 
 public class LUDecomposition {
@@ -121,8 +121,8 @@ public class LUDecomposition {
 		final int posW10C = posWC;
 		final int posW11R = posWR + (halfNb * BLOCK_SIZE);
 		final int posW11C = posWC + (halfNb * BLOCK_SIZE);
-		syncsteal {
-			steal {
+		finish {
+			async {
 				schur(posM00R, posM00C, posV00R, posV00C, posW00R, posW00C, halfNb);
 				schur(posM01R, posM01C, posV00R, posV00C, posW01R, posW01C, halfNb);
 				schur(posM10R, posM10C, posV10R, posV10C, posW00R, posW00C, halfNb);
@@ -130,8 +130,8 @@ public class LUDecomposition {
 			}
 		}
 
-		syncsteal {
-			steal {
+		finish {
+			async {
 				schur(posM00R, posM00C, posV01R, posV01C, posW10R, posW10C, halfNb);
 				schur(posM01R, posM01C, posV01R, posV01C, posW11R, posW11C, halfNb);
 				schur(posM10R, posM10C, posV11R, posV11C, posW10R, posW10C, halfNb);
@@ -154,8 +154,8 @@ public class LUDecomposition {
 		final int posM10C = posMC;
 		final int posM11R = posMR + (halfNb * BLOCK_SIZE);
 		final int posM11C = posMC + (halfNb * BLOCK_SIZE);
-		syncsteal {
-			steal {
+		finish {
+			async {
 				auxLowerSolve(posM00R, posM00C, posM10R, posM10C, posLR, posLC, halfNb);
 				auxLowerSolve(posM01R, posM01C, posM11R, posM11C, posLR, posLC, halfNb);
 			}
@@ -190,8 +190,8 @@ public class LUDecomposition {
 		final int posM10C = posMC;
 		final int posM11R = posMR + (halfNb * BLOCK_SIZE);
 		final int posM11C = posMC + (halfNb * BLOCK_SIZE);
-		syncsteal {
-			steal {
+		finish {
+			async {
 				auxUpperSolve(posM00R, posM00C, posM01R, posM01C, posUR, posUC, halfNb);
 				auxUpperSolve(posM10R, posM10C, posM11R, posM11C, posUR, posUC, halfNb);
 			}
@@ -227,8 +227,8 @@ public class LUDecomposition {
 		final int pos11R = posR + (halfNb * BLOCK_SIZE);
 		final int pos11C = posC + (halfNb * BLOCK_SIZE);
 		calcLU(pos00R, pos00C, halfNb);
-		syncsteal {
-			steal {
+		finish {
+			async {
 				lowerSolve(pos01R, pos01C, pos00R, pos00C, halfNb);
 				upperSolve(pos10R, pos10C, pos00R, pos00C, halfNb);
 			}

@@ -175,7 +175,7 @@ public class UTS {
 	public final void compute() {
 		initRoot();
 		startTimer();
-		syncsteal {
+		finish {
 			search(root);
 		}
 		stopTimer();
@@ -186,7 +186,7 @@ public class UTS {
 		maxUTSDepth.set(Math.max(parent.height, maxUTSDepth.get()));
 		int numChildren = parent.numChildren();
 		if (numChildren > 0) {
-			steal {
+			async {
 				for(int i = 0; i < numChildren; i++) {
 					core(parent, i);
 				}

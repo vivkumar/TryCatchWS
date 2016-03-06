@@ -22,8 +22,8 @@ public class Integrate {
 		double expr1 = 0.0;
 		double expr2 = 0.0;
 
-		syncsteal {
-			steal {
+		finish {
+			async {
 				expr1 = recEval(c, fc, r, fr, ar); 
 				expr2 = recEval(l, fl, c, fc, al);
 			}

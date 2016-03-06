@@ -56,8 +56,8 @@ public class Fib {
 		int a = 0;
 		int b = 0;
 		if (n <= 2) return 1;
-		syncsteal {
-			steal {
+		finish {
+			async {
 				a = fib(n-1);
 				b = fib(n-2);
 			}

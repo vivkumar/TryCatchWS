@@ -55,7 +55,7 @@
  */
 
 /*
- * Vivek Kumar: Ported to JavaTC work-stealing.  
+ * Vivek Kumar: Ported to JavaTC work-asyncing.  
  */
 
 import java.util.Random;
@@ -186,8 +186,8 @@ public class CilkSort {
 		lowsize = split1 - low1 + split2 - low2;
 		dest[(lowdest + lowsize + 1)] = src[split1];
 
-		syncsteal {
-			steal {
+		finish {
+			async {
 				cilkmerge(low1, split1 - 1, low2, split2, lowdest, src, dest);
 				cilkmerge(split1 + 1, high1, split2 + 1, high2, lowdest + lowsize + 2, src, dest);
 			}
@@ -217,8 +217,8 @@ public class CilkSort {
 		D = C + quarter;
 		tmpD = tmpC + quarter;
 
-		syncsteal {
-			steal {
+		finish {
+			async {
 				cilksort(A, tmpA, quarter);
 				cilksort(B, tmpB, quarter);
 				cilksort(C, tmpC, quarter);
@@ -226,8 +226,8 @@ public class CilkSort {
 			}
 		}
 
-		syncsteal {
-			steal {
+		finish {
+			async {
 				cilkmerge(A, A + quarter - 1, B, B + quarter - 1, tmpA, array, tmp);
 				cilkmerge(C, C + quarter - 1, D, low + size - 1, tmpC, array, tmp);
 			}

@@ -20,7 +20,7 @@
  */
 
 /*
- * Vivek Kumar: Ported to JavaTC work-stealing.  
+ * Vivek Kumar: Ported to JavaTC work-asyncing.  
  */
 
 class COMPLEX {
@@ -46,8 +46,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					compute_w_coefficients(n, a, ab, W);
 					compute_w_coefficients(n, ab + 1, b, W);
 				}
@@ -95,8 +95,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					unshuffle(a, ab, startIndexInOut, in, out, r, m);
 					unshuffle(ab, b, startIndexInOut, in, out, r, m);
 				}
@@ -134,8 +134,8 @@ public class FFT {
 		}
 		else {
 			final int i2 = (i + i1) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_gen(i, i2, startIndexInOut, in, out, W, nW, nWdn, r, m);
 					fft_twiddle_gen(i2, i1, startIndexInOut, in, out, W, nW, nWdn, r, m);
 				}
@@ -178,8 +178,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_2(a, ab, startIndexInOut, in, out, W, nW, nWdn, m);
 					fft_twiddle_2(ab, b, startIndexInOut, in, out, W, nW, nWdn, m);
 				}
@@ -198,8 +198,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_unshuffle_2(a, ab, startIndexInOut, in, out, m);
 					fft_unshuffle_2(ab, b, startIndexInOut, in, out, m);
 				}
@@ -322,8 +322,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_4(a, ab, startIndexInOut, in, out, W, nW, nWdn, m);
 					fft_twiddle_4(ab, b, startIndexInOut, in, out, W, nW, nWdn, m);
 				}
@@ -346,8 +346,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_unshuffle_4(a, ab, startIndexInOut, in, out, m);
 					fft_unshuffle_4(ab, b, startIndexInOut, in, out, m);
 				}
@@ -658,8 +658,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_8(a, ab, startIndexInOut, in, out, W, nW, nWdn, m);
 					fft_twiddle_8(ab, b, startIndexInOut, in, out, W, nW, nWdn, m);
 				}
@@ -690,8 +690,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_unshuffle_8(a, ab, startIndexInOut, in, out, m);
 					fft_unshuffle_8(ab, b, startIndexInOut, in, out, m);
 				}
@@ -1450,8 +1450,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_16(a, ab, startIndexInOut, in, out, W, nW, nWdn, m);
 					fft_twiddle_16(ab, b, startIndexInOut, in, out, W, nW, nWdn, m);
 				}
@@ -1498,8 +1498,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_unshuffle_16(a, ab, startIndexInOut, in, out, m);
 					fft_unshuffle_16(ab, b, startIndexInOut, in, out, m);
 				}
@@ -3314,8 +3314,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_twiddle_32(a, ab, startIndexInOut, in, out, W, nW, nWdn, m);
 					fft_twiddle_32(ab, b, startIndexInOut, in, out, W, nW, nWdn, m);
 				}
@@ -3394,8 +3394,8 @@ public class FFT {
 		}
 		else {
 			final int ab = (a + b) / 2;
-			syncsteal {
-				steal {
+			finish {
+				async {
 					fft_unshuffle_32(a, ab, startIndexInOut, in, out, m);
 					fft_unshuffle_32(ab, b, startIndexInOut, in, out, m);
 				}
@@ -3440,8 +3440,8 @@ public class FFT {
 			else 
 				unshuffle(0, m, startIndexInOut, in, out, r, m);
 
-			syncsteal {
-				steal {
+			finish {
+				async {
 					for(int k = 0; k < n; k += m) {
 						fft_aux(m, startIndexInOut + k, out, in, posFactors + 1, factors, W, nW);
 					}

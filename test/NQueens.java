@@ -16,8 +16,8 @@
  * Note the use of single "finish" statement in find_queens() that awaits termination of all
  * async's created by the recursive calls to nqueens_kernel.
  * 
- * This program is a good example to illustrate the performance benefits of work-stealing vs. work-sharing schedulers.
- * Try "hjc nqueens.hj" to create a work-sharing implementation (default) and "hjc -rt w nqueens.hj" to create a work-stealing
+ * This program is a good example to illustrate the performance benefits of work-asyncing vs. work-sharing schedulers.
+ * Try "hjc nqueens.hj" to create a work-sharing implementation (default) and "hjc -rt w nqueens.hj" to create a work-asyncing
  * implementation, and compare their performance by executing "hj nqueens 12 5 3" to solve a 12-queens problem with 5 repetitions and a cutoff at depth 3.
  * To study scalability on a multicore processor, you can execute "hj -places 1:<w> nqueens 12 5 3", where <w> is the number of worker threads.
  * Since "12 5 3" are default values, you can obtain the same measurements by executing "hj nqueens" and "hj -places 1:<w> nqueens"
@@ -132,7 +132,7 @@ public class NQueens {
 
 	public void compute() {
 		final long startTime = System.currentTimeMillis();
-		syncsteal {
+		finish {
 			nqueens(A, 0);
 		}
 		final long time = System.currentTimeMillis() - startTime;
@@ -147,7 +147,7 @@ public class NQueens {
 		}
 
 		/* try each possible position for queen <depth> */
-		steal {
+		async {
 			for (int i=0; i < size; i++) {
 				nqueens_kernel(A, depth, i);
 			}

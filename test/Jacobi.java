@@ -5,7 +5,7 @@
  */
 
 /*
- * Vivek Kumar: Ported to JavaTC work-stealing.  
+ * Vivek Kumar: Ported to JavaTC work-asyncing.  
  */
 
 public class Jacobi {
@@ -115,8 +115,8 @@ public class Jacobi {
 			return processLeafNode(a, b, lr, hr, lc, hc, steps);
 		}
 		else if(hrows * hcols >= leafs) {
-			syncsteal {
-				steal {
+			finish {
+				async {
 					df1 = buildNode(a, b, lr, mr, lc, mc, leafs, steps);
 					df2 = buildNode(a, b, lr, mr, mc + 1, hc, leafs, steps);
 					df3 = buildNode(a, b, mr + 1, hr, lc, mc, leafs, steps);
@@ -126,8 +126,8 @@ public class Jacobi {
 			return ((((df1 > df2) ? df1 : df2) > df3 ? ((df1 > df2) ? df1 : df2) : df3) > df4) ? (((df1 > df2) ? df1 : df2) > df3 ? ((df1 > df2) ? df1 : df2) : df3) : df4;
 		}
 		else if(cols >= rows) {
-			syncsteal {
-				steal {
+			finish {
+				async {
 					df1 = buildNode(a, b, lr, hr, lc, mc, leafs, steps);
 					df2 = buildNode(a, b, lr, hr, mc + 1, hc, leafs, steps);
 				}
@@ -135,8 +135,8 @@ public class Jacobi {
 			return ((df1 > df2) ? df1 : df2);
 		}
 		else {
-			syncsteal {
-				steal {
+			finish {
+				async {
 					df1 = buildNode(a, b, lr, mr, lc, hc, leafs, steps);
 					df2 = buildNode(a, b, mr + 1, hr, lc, hc, leafs, steps);
 				}
