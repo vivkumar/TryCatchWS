@@ -7,7 +7,7 @@ This is the software implementation of JikesRVM Java Try-Catch work-stealing fra
 3) JastAdd compiler jar file to inject Try-Catch code blocks to support work-stealing.
 
 
-You may use this software for your research. This software is still evolving at The Australian National University. Whenever there is any enhancement or bug fixes, this download page will be updated. As a courtesy to the developers, please cite the following papers while using this software for publications:
+You may use this software for your research. This software is still evolving at The Australian National University. Whenever there is any enhancement or bug fixes, this download page will be updated. Please cite the following papers while using this software for any publications:
 
 BibTex:
 
