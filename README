@@ -1,0 +1,91 @@
+========================================================
+STEPS TO USE FEATHERLIGHT SPECULATIVE TASK PARALLELISM
+========================================================
+
+1) Build JikesRVM
+git clone https://github.com/JikesRVM/JikesRVM.git
+cd JikesRVM
+git checkout 087d300
+git am --signoff <PATH TO jikesrvm.patch>
+./bin/buildit localhost production -j <PATH TO jdk1.6.0 INSTALLATION DIRECTORY>
+If the above build fails then simply  retry the above command without doing any modifications
+
+2) Build AJWS 
+git clone https://github.com/vivkumar/ajws.git
+cd ajws
+git checkout bd5535f
+git am --signoff <PATH TO>/ajws.patch
+cd src
+ant jar
+
+3) Setup Translation Script
+Set the following two paths in the script: "translator/transform.sh"
+a) Absolute path to JikesRVM build directory that contains the jar file jksvm.jar
+b) Absolute path to AJWS directory that contains the jar file AJWS.jar
+
+4) Using micro benchmarks
+
+a) Compilation
+cd benchmarks/micro
+Set the paths correctly inside make.inc
+make
+
+b) Running Featherlight version of the applicaions
+As an example, following are the steps to run Featherlight version of UTS:
+cd benchmarks/micro/UTS/classes
+/PATH TO/JikesRVM/dist/<BUILD NAME>/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1 -Xws:pinAuto=true -Xws:autoThreads=true -Xws:procs=<TOTAL WORKSTEALING WORKERS> Featherlight
+
+c) Running Sequential version of the applications
+As an example, following are the steps to run Sequential version of UTS:
+cd benchmarks/micro/UTS/classes
+/PATH TO/JikesRVM/dist/<BUILD NAME>/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1 Sequential
+
+d) Running ForkJoin version of the applications
+As an example, following are the steps to run ForkJoin version of UTS:
+cd benchmarks/micro/UTS/classes
+/PATH TO/JikesRVM/dist/<BUILD NAME>/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1 -Xws:pinAuto=true -cp ../../jsr166y.jar:. ForkJoin <NUMBER OF THREADS>
+
+e) Running ManualAbort version of the applicaions
+As an example, following are the steps to run ManualAbort version of UTS:
+cd benchmarks/micro/UTS/classes
+/PATH TO/JikesRVM/dist/<BUILD NAME>/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1 -Xws:pinAuto=true -Xws:autoThreads=true -Xws:procs=<TOTAL WORKSTEALING WORKERS> ManualAbort
+
+5) Using Dacapo lusearch-fix
+This will work with following steps only if you follow the directory structure mentioned below:
+
+cd benchmarks
+wget -c https://sourceforge.net/projects/dacapobench/files/9.12-bach-MR1/dacapo-9.12-MR1-bach-src.zip/download -O dacapo.zip
+mkdir dacapo
+cd dacapo
+unzip ../dacapo.zip
+git init
+git add .
+git commit -m 'base'
+git am --signoff ../../dacapo.patch
+
+a) Featherlight version of lusearch-fix
+cd benchmarks/dacapo/benchmarks/bms/Featherlight
+make
+cd ../../
+/path to JikesRVM build directory/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1  -Xws:autoThreads=true -Xws:pinAuto=true -Xws:procs=<NUMBER OF THREADS> -jar dacapo.jar -c org.dacapo.harness.EuroPAR19 -n <ITERATIONS> lusearch-fix
+
+b) ManualAbort version of lusearch-fix
+cd benchmarks/dacapo/benchmarks/bms/ManualAbort
+make
+cd ../../
+/path to JikesRVM build directory/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1  -Xws:autoThreads=true -Xws:pinAuto=true -Xws:procs=<NUMBER OF THREADS> -jar dacapo.jar -c org.dacapo.harness.EuroPAR19 -n <ITERATIONS> lusearch-fix
+
+c) ForJoin version of lusearch-fix
+cd benchmarks/dacapo/benchmarks/bms/ForkJoin
+make
+cd ../../
+export JIKES=<Absolute Path to JikesRVM>/JikesRVM/dist/<Build Directory Name>
+$JIKES/rvm  -Xms3G -X:gc:variableSizeHeap=false -Xws:pinAuto=true -X:gc:threads=1 -X:vmClasses=$JIKES/jksvm.jar:$JIKES/rvmrt.jar:../../micro/jsr166y.jar -jar dacapo.jar -c org.dacapo.harness.EuroPAR19 -n <Total Iterations> lusearch-fix -t <Total Threads>
+
+d) Sequential version of lusearch-fix
+cd benchmarks/dacapo/benchmarks/bms/Sequential
+make
+cd ../../
+/path to JikesRVM build directory/rvm -Xms3G -X:gc:variableSizeHeap=false -X:gc:threads=1  -jar dacapo.jar -c org.dacapo.harness.EuroPAR19 -n <ITERATIONS> lusearch-fix
+
+

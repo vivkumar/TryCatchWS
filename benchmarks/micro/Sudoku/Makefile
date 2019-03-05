@@ -1,0 +1,26 @@
+include ../make.inc
+
+all: Create Sequential.class Speculative.class ManualAbort.class ForkJoin.class
+
+Create:
+	mkdir -p classes 2>/dev/null
+	cp *.java classes/.
+	cp 16x16-1.txt classes/.
+
+Sequential.class:
+	javac -cp $(JIKESRVM):. Sequential.java
+	mv *.class classes/.
+
+Speculative.class:
+	$(TRANSLATOR) Speculative.java
+
+ManualAbort.class:
+	$(TRANSLATOR) ManualAbort.java
+
+ForkJoin.class:
+	javac -cp $(JIKESRVM):../jsr166y.jar:. ForkJoin.java
+	mv *.class classes/.
+
+clean:
+	rm -rf classes logs 2>/dev/null
+	
