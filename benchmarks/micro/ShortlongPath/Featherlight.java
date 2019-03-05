@@ -1,11 +1,11 @@
-public class Speculative implements Config.Benchmark {
-  public Speculative() {
+public class Featherlight implements Config.Benchmark {
+  public Featherlight() {
   }
 
   public static void main(final String[] args) {
     String type = args.length>0?args[0]:"T3";
     int goalRate = args.length>1?Integer.parseInt(args[1]):25000;
-    Speculative benchmark = new Speculative();
+    Featherlight benchmark = new Featherlight();
     System.out.println("Initializing...");
     Config.setup(type, goalRate);
     System.out.println("Args: ");

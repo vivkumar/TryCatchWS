@@ -1,14 +1,14 @@
 import java.util.PriorityQueue;
 import java.util.Queue;
 
-public class Speculative implements Config.Benchmark {
+public class Featherlight implements Config.Benchmark {
 
-  public Speculative() { 
+  public Featherlight() { 
     this.solution = null;
   }
 
   public static void main(final String[] args) {
-    Speculative benchmark = new Speculative();
+    Featherlight benchmark = new Featherlight();
     Config.boardInit();
     System.out.println("Args: ");
     Config.printArgs();

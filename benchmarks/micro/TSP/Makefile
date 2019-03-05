@@ -1,6 +1,6 @@
 include ../make.inc
 
-all: Create Sequential.class Speculative.class ManualAbort.class ForkJoin.class
+all: Create Sequential.class Featherlight.class ManualAbort.class ForkJoin.class
 
 Create:
 	mkdir -p classes 2>/dev/null
@@ -10,8 +10,8 @@ Sequential.class:
 	javac -cp $(JIKESRVM):. Sequential.java
 	mv *.class classes/.
 
-Speculative.class:
-	$(TRANSLATOR) Speculative.java
+Featherlight.class:
+	$(TRANSLATOR) Featherlight.java
 
 ManualAbort.class:
 	$(TRANSLATOR) ManualAbort.java

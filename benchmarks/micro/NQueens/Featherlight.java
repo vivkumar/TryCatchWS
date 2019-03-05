@@ -1,6 +1,6 @@
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class Speculative implements Config.Benchmark {
+public class Featherlight implements Config.Benchmark {
   private  AtomicInteger nSolutions;
   private int CUTOFF;
   private int[] A;
@@ -10,7 +10,7 @@ public class Speculative implements Config.Benchmark {
     int size = 14;
     if (args.length > 0)
       size = Integer.parseInt(args[0]);
-    Speculative nq = new Speculative(size);
+    Featherlight nq = new Featherlight(size);
     Config.launch(nq);
   }
 
@@ -18,7 +18,7 @@ public class Speculative implements Config.Benchmark {
     return nSolutions.get() >= CUTOFF;
   }
 
-  public Speculative(int size) {
+  public Featherlight(int size) {
     this.size = size;
     this.CUTOFF = (int) (0.02 * Config.solutions[size - 1]);
     System.out.println("Size = "+size+" Cutoff = "+this.CUTOFF);

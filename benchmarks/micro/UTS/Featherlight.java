@@ -1,15 +1,15 @@
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class Speculative implements Config.Benchmark {
+public class Featherlight implements Config.Benchmark {
 
-  public Speculative() {
+  public Featherlight() {
   }
 
   public static void main(final String[] args) {
     String type = args.length>0?args[0] : "T1";
     int maxHeight = args.length>1 ? Integer.parseInt(args[1]) : 10;
     double itemToFindLoc = args.length>2 ? Double.parseDouble(args[2]) : 0.65;
-    Speculative benchmark = new Speculative();
+    Featherlight benchmark = new Featherlight();
     System.out.println("Initializing...");
     Config.setup(type, maxHeight, itemToFindLoc);
     System.out.println("Args: ");

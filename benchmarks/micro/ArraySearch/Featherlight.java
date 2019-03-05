@@ -5,13 +5,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * @Author: Vivek Kumar
  */
-public class Speculative implements Config.Benchmark {
+public class Featherlight implements Config.Benchmark {
   private final int rows, cols, goalCount;
   private static final AtomicInteger hits = new AtomicInteger();
   private static Config.Complex[][] array;
   private static final List<Config.Complex> itemsToSearch = new ArrayList<Config.Complex>();
 
-  private Speculative(int rows, int cols, int goalCount) {  
+  private Featherlight(int rows, int cols, int goalCount) {  
     this.rows = rows;
     this.cols = cols;
     this.goalCount = goalCount;
@@ -46,7 +46,7 @@ public class Speculative implements Config.Benchmark {
     final int goalCount = args.length > 0 ? Integer.parseInt(args[0]) : 10;
     final int rows = args.length > 1 ? Integer.parseInt(args[1]) : 1000;
     final int cols = args.length > 2 ? Integer.parseInt(args[2]) : 20000;
-    Speculative benchmark = new Speculative(rows, cols, goalCount);
+    Featherlight benchmark = new Featherlight(rows, cols, goalCount);
     array = Config.setup(rows, cols, goalCount, itemsToSearch);
     Config.launch(benchmark);
   }

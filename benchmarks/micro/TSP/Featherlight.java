@@ -1,10 +1,10 @@
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class Speculative implements Config.Benchmark {
+public class Featherlight implements Config.Benchmark {
   public static void main(final String[] args) {
     int numCities = args.length>0?Integer.parseInt(args[0]) : 20;
     int goal = args.length>1?Integer.parseInt(args[1]) : 156;
-    Speculative benchmark = new Speculative(numCities, goal);
+    Featherlight benchmark = new Featherlight(numCities, goal);
     Config.launch(benchmark);
   }
 
@@ -29,7 +29,7 @@ public class Speculative implements Config.Benchmark {
   private byte[] citiesVisited;
   private AtomicInteger bestSolution = new AtomicInteger();
 
-  public Speculative(int nc, int goal) {
+  public Featherlight(int nc, int goal) {
     numCities = nc;
     Config.SHORTEST_PATH_GOAL = goal;
     if(costMatrix == null) costMatrix = Config.initializeCostMatrix(numCities);
